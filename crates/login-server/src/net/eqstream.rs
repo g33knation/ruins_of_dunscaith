@@ -1,8 +1,6 @@
 use bytes::BufMut;
 use shared::net::eq_stream::{EqStreamSession as SharedSession, SessionRequest, ProcessPacketResult};
 use shared::opcodes::OpCode;
-use num_traits::FromPrimitive;
-use std::io::Write;
 
 pub struct EqStreamSession {
     session: SharedSession,

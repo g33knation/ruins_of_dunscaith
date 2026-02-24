@@ -1,5 +1,4 @@
 pub mod client_socket;
-pub mod packet;
 pub mod discovery;
 pub mod login_session; // Replaced client_system
 pub mod client_state;

@@ -1,6 +1,6 @@
 use crate::net::client_socket::ClientSocket;
 use anyhow::{Context, Result};
-use binrw::{BinRead, BinWrite}; // <--- MUST BE USED
+use binrw::BinWrite; // <--- MUST BE USED
 use shared::opcodes::OpCode;
 use tracing::{debug, error, info, instrument, warn};
 
