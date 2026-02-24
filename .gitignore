@@ -1,0 +1,15 @@
+/target
+.aider*
+.env
+*.log
+*.pcap
+*.txt
+*.sql
+*.zip
+*.bin
+*.h
+/aider-venv-311
+/venv
+/captures
+/peq-dump
+!README.md
