@@ -1,0 +1,29 @@
+services:
+  login:
+    build: .
+    command: [ "./login-server" ]
+    network_mode: host
+    environment:
+      - DATABASE_URL=postgres://eqemu:eqemupass@127.0.0.1:5432/peq
+      - RUST_LOG=info
+      - PUBLIC_IP=192.168.1.24
+
+  world:
+    build: .
+    command: [ "./world-server" ]
+    network_mode: host
+    environment:
+      - DATABASE_URL=postgres://eqemu:eqemupass@127.0.0.1:5433/peq
+      - RUST_LOG=info
+    depends_on:
+      - login
+
+  zone:
+    build: .
+    command: [ "./zone-server" ]
+    network_mode: host
+    environment:
+      - DATABASE_URL=postgres://eqemu:eqemupass@127.0.0.1:5433/peq
+      - RUST_LOG=info
+    depends_on:
+      - world

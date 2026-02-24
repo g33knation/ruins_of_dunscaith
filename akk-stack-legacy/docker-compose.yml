@@ -1,0 +1,245 @@
+networks:
+  backend:
+    driver: ${NETWORKS_DRIVER}
+
+volumes:
+  build-cache:
+  spire-assets:
+  eqemu-var-log:
+  mariadb-var-log:
+
+services:
+
+  #############################################
+  # eqemu server
+  #############################################
+
+  eqemu-server:
+    hostname: ${SERVER_HOSTNAME:-}
+    restart: unless-stopped
+    image: eqemulator/eqemu-server:v16
+    volumes:
+      - ./server:/home/eqemu/server:delegated
+      - ./code:/home/eqemu/code:delegated
+      - ./assets:/home/eqemu/assets:delegated
+      - build-cache:/home/eqemu/.ccache/
+      - spire-assets:/home/eqemu/.cache/
+      - eqemu-var-log:/var/log/
+    ports:
+      - ${IP_ADDRESS}:2222:22/tcp
+      - ${IP_ADDRESS}:2222:22/udp
+      - ${IP_ADDRESS}:3000-3010:3000-3010
+      - ${IP_ADDRESS}:8080:8080
+      - ${IP_ADDRESS}:9001:9001/tcp
+      - ${IP_ADDRESS}:9001:9001/udp
+      - ${IP_ADDRESS}:9000:9000/tcp
+      - ${IP_ADDRESS}:9000:9000/udp
+      - ${IP_ADDRESS}:5999:5999/tcp
+      - ${IP_ADDRESS}:5999:5999/udp
+      - ${IP_ADDRESS}:5998:5998/tcp
+      - ${IP_ADDRESS}:5998:5998/udp
+      - ${IP_ADDRESS}:6000:6000/tcp
+      - ${IP_ADDRESS}:7778:7778/tcp
+      - ${IP_ADDRESS}:7778:7778/udp
+      - ${IP_ADDRESS}:9500:9500/tcp
+      - ${IP_ADDRESS}:9500:9500/udp
+      - ${IP_ADDRESS}:${PORT_RANGE_LOW:-7000}-${PORT_RANGE_HIGH}:${PORT_RANGE_LOW:-7000}-${PORT_RANGE_HIGH}/udp
+    environment:
+      - SPIRE_PORT=${SPIRE_PORT:-3000}
+      - SPIRE_ADMIN_PASSWORD=${SPIRE_ADMIN_PASSWORD:-}
+      - SERVER_PASSWORD=${SERVER_PASSWORD}
+      - EQEMU_DB_PASSWORD=${MARIADB_PASSWORD}
+      - PEQ_EDITOR_PASSWORD=${PEQ_EDITOR_PASSWORD}
+      - IP_ADDRESS=${IP_ADDRESS}
+      - PORT_RANGE_HIGH=${PORT_RANGE_HIGH}
+      - TZ=${TZ:-US/Central}
+    tty: true
+    networks:
+      - backend
+    cap_add:
+      # This is needed for running perf traces
+      # - CAP_SYS_ADMIN
+      # For GDB traces but it has security implications
+      - SYS_PTRACE
+    cpu_shares: 900
+    depends_on:
+      - fail2ban-server
+
+  #############################################
+  # mariadb
+  #############################################
+
+  mariadb:
+    restart: unless-stopped
+    build:
+      context: ./containers/mariadb
+      args:
+        - INNODB_BUFFER_POOL_SIZE=${INNODB_BUFFER_POOL_SIZE:-256MB}
+    ports:
+      - ${IP_ADDRESS}:3306:3306
+    volumes:
+      - ${DATA_PATH_HOST}/mariadb:/var/lib/mysql:delegated
+      - mariadb-var-log:/var/log/mysql/
+    environment:
+      - MYSQL_DATABASE=${MARIADB_DATABASE}
+      - MYSQL_USER=${MARIADB_USER}
+      - MYSQL_PASSWORD=${MARIADB_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MARIADB_ROOT_PASSWORD}
+      - MYSQL_ALLOW_EMPTY_PASSWORD=NO
+      - TZ=${TZ:-US/Central}
+    networks:
+      - backend
+    depends_on:
+      - fail2ban-mysqld
+
+  #############################################
+  # fail2ban
+  #############################################
+
+  fail2ban-server:
+    restart: unless-stopped
+    build:
+      context: containers/fail2ban-server
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - F2B_LOG_LEVE=DEBUG
+      - F2B_DB_PURGE_AGE=30d
+      - F2B_MAX_RETRY=3
+      - F2B_ACTION=%(action_)s
+      - F2B_IPTABLES_CHAIN=DOCKER-USER
+      - TZ=${TZ:-US/Central}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/log:/var/log:ro
+      - eqemu-var-log:/eqemu/var/log/
+
+  fail2ban-mysqld:
+    restart: unless-stopped
+    build:
+      context: containers/fail2ban-mariadb
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - F2B_LOG_LEVE=DEBUG
+      - F2B_DB_PURGE_AGE=30d
+      - F2B_MAX_RETRY=3
+      - F2B_ACTION=%(action_)s
+      - F2B_IPTABLES_CHAIN=DOCKER-USER
+      - TZ=${TZ:-US/Central}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/log:/var/log:ro
+      - mariadb-var-log:/mariadb/var/log/mysql/
+
+  #############################################
+  # phpmyadmin
+  #############################################
+
+  phpmyadmin-proxy:
+    build: ./containers/http-proxy
+    restart: unless-stopped
+    ports:
+      - ${IP_ADDRESS}:8082:80
+    environment:
+      - BASIC_AUTH_USERNAME=${PHPMYADMIN_USERNAME}
+      - BASIC_AUTH_PASSWORD=${PHPMYADMIN_PASSWORD}
+      - PROXY_PASS=http://phpmyadmin
+      - TZ=${TZ:-US/Central}
+    networks:
+      - backend
+
+  phpmyadmin:
+    depends_on:
+      - phpmyadmin-proxy
+    restart: unless-stopped
+    image: phpmyadmin/phpmyadmin:latest
+    environment:
+      - PMA_HOST=mariadb
+      - PMA_USER=${MARIADB_USER}
+      - PMA_PASSWORD=${MARIADB_PASSWORD}
+      - TZ=${TZ:-US/Central}
+    networks:
+      - backend
+
+  #############################################
+  # peq editor
+  #############################################
+
+  peq-editor-proxy:
+    build: ./containers/http-proxy
+    restart: unless-stopped
+    ports:
+      - "${IP_ADDRESS}:8081:80"
+    environment:
+      - BASIC_AUTH_USERNAME=${PEQ_EDITOR_PROXY_USERNAME:-peq-editor}
+      - BASIC_AUTH_PASSWORD=${PEQ_EDITOR_PROXY_PASSWORD}
+      - PROXY_PASS=http://peq-editor
+      - TZ=${TZ:-US/Central}
+    networks:
+      - backend
+
+  peq-editor:
+    depends_on:
+      - peq-editor-proxy
+    image: eqemulator/peq-editor:latest
+    restart: unless-stopped
+    volumes:
+      - ${DATA_PATH_HOST}/peq-editor:/var/www/html
+    environment:
+      DB_HOST: mariadb
+      DB_NAME: ${MARIADB_DATABASE}
+      DB_USER: ${MARIADB_USER}
+      DB_PASSWORD: ${MARIADB_PASSWORD}
+      TZ: ${TZ:-US/Central}
+    networks:
+      - backend
+
+  #############################################
+  # ftp
+  #############################################
+
+  ftp-quests:
+    image: stilliard/pure-ftpd
+    restart: unless-stopped
+    environment:
+      FTP_USER_UID: 1000
+      FTP_USER_GID: 1000
+      FTP_USER_NAME: quests
+      FTP_USER_PASS: ${FTP_QUESTS_PASSWORD}
+      FTP_USER_HOME: '/home/quests/'
+      FTP_MAX_CLIENTS: 25
+      FTP_PASSIVE_PORTS: '30000:30049'
+      PUBLICHOST: ${IP_ADDRESS}
+      TZ: ${TZ:-US/Central}
+    volumes:
+      - ./server/quests/:/home/quests/
+    ports:
+      - ${IP_ADDRESS}:21:21
+      - ${IP_ADDRESS}:30000-30049:30000-30049
+    networks:
+      - backend
+
+  #############################################
+  # backup
+  #############################################
+
+  backup-cron:
+    restart: unless-stopped
+    image: eqemulator/eqemu-backup-cron:latest
+    build:
+      context: ./containers/backup-cron
+    hostname: backup-cron
+    tty: true
+    volumes:
+      - ./:/home/backup-cron/
+    environment:
+      TZ: America/Chicago
+    #      HOST_NAME: ${HOSTNAME:-default}
+    #      HOST_DIR: ${PWD}
+    networks:
+      - backend

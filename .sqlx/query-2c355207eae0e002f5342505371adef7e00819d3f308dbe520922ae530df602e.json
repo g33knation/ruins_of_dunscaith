@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO characters (\n                id, account_id, name, race, class, gender, level, \n                str, sta, dex, agi, int, wis, cha, deity, zone_id,\n                x, y, z, heading\n            )\n            VALUES (\n                DEFAULT, $1, $2, $3, $4, $5, $6,\n                $7, $8, $9, $10, $11, $12, $13, $14, $15,\n                0.0, 0.0, 0.0, 0.0\n            )\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Varchar",
+        "Int2",
+        "Int2",
+        "Int2",
+        "Int2",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int2",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2c355207eae0e002f5342505371adef7e00819d3f308dbe520922ae530df602e"
+}

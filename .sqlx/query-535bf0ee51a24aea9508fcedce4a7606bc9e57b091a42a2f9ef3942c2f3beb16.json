@@ -1,0 +1,232 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT \n                            id, account_id, name, \n                            NULL::text as last_name, \n                            COALESCE(NULL, 0) as \"zone_id!\", \n                            COALESCE(NULL, 0) as \"zone_instance!\",\n                            COALESCE(NULL, 0.0)::real as \"y!\", \n                            COALESCE(NULL, 0.0)::real as \"x!\", \n                            COALESCE(NULL, 0.0)::real as \"z!\", \n                            COALESCE(NULL, 0.0)::real as \"heading!\",\n                            COALESCE(NULL, 0)::smallint as \"gender!\", \n                            COALESCE(NULL, 0)::smallint as \"race!\", \n                            COALESCE(NULL, 0)::smallint as \"class!\", \n                            COALESCE(NULL, 0)::smallint as \"level!\",\n                            COALESCE(NULL, 0) as \"exp!\", \n                            COALESCE(NULL, 0) as \"practice_points!\", \n                            COALESCE(NULL, 0) as \"mana!\", \n                            COALESCE(NULL, 0) as \"cur_hp!\", \n                            COALESCE(NULL, 0) as \"endurance!\",\n                            COALESCE(NULL, 0) as \"str!\", \n                            COALESCE(NULL, 0) as \"sta!\", \n                            COALESCE(NULL, 0) as \"cha!\", \n                            COALESCE(NULL, 0) as \"dex!\", \n                            COALESCE(NULL, 0) as \"int!\", \n                            COALESCE(NULL, 0) as \"agi!\", \n                            COALESCE(NULL, 0) as \"wis!\",\n                            COALESCE(NULL, 0) as \"face!\", \n                            COALESCE(NULL, 0) as \"hair_style!\", \n                            COALESCE(NULL, 0) as \"hair_color!\", \n                            COALESCE(NULL, 0) as \"beard!\", \n                            COALESCE(NULL, 0) as \"beard_color!\", \n                            COALESCE(NULL, 0) as \"eye_color_1!\", \n                            COALESCE(NULL, 0) as \"eye_color_2!\",\n                            COALESCE(NULL, 0) as \"drakkin_heritage!\", \n                            COALESCE(NULL, 0) as \"drakkin_tattoo!\", \n                            COALESCE(NULL, 0) as \"drakkin_details!\"\n                        FROM characters WHERE account_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "account_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "last_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "zone_id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "zone_instance!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "y!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 7,
+        "name": "x!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 8,
+        "name": "z!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 9,
+        "name": "heading!",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 10,
+        "name": "gender!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 11,
+        "name": "race!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 12,
+        "name": "class!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 13,
+        "name": "level!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 14,
+        "name": "exp!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 15,
+        "name": "practice_points!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 16,
+        "name": "mana!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "cur_hp!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 18,
+        "name": "endurance!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 19,
+        "name": "str!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 20,
+        "name": "sta!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 21,
+        "name": "cha!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 22,
+        "name": "dex!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 23,
+        "name": "int!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 24,
+        "name": "agi!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 25,
+        "name": "wis!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 26,
+        "name": "face!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 27,
+        "name": "hair_style!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 28,
+        "name": "hair_color!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 29,
+        "name": "beard!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 30,
+        "name": "beard_color!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 31,
+        "name": "eye_color_1!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 32,
+        "name": "eye_color_2!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 33,
+        "name": "drakkin_heritage!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 34,
+        "name": "drakkin_tattoo!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 35,
+        "name": "drakkin_details!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "535bf0ee51a24aea9508fcedce4a7606bc9e57b091a42a2f9ef3942c2f3beb16"
+}

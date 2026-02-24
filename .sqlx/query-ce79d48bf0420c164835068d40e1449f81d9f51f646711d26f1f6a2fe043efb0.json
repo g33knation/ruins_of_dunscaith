@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                         SELECT \n                            item_id, \n                            slot_id::smallint as \"slot_id!\", \n                            quantity::smallint as \"quantity!\"\n                         FROM inventory_items \n                         WHERE char_id = $1\n                         ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "slot_id!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 2,
+        "name": "quantity!",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "ce79d48bf0420c164835068d40e1449f81d9f51f646711d26f1f6a2fe043efb0"
+}

@@ -1,0 +1,19 @@
+[package]
+name = "zone-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../shared" }
+tokio = { version = "1.36", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+binrw = "0.13"
+bytes = "1.5"
+flate2 = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+dotenv = "0.15"
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "macros", "chrono"] }
+slotmap = "1.1.1"
+rand = "0.8"

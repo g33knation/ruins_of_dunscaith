@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/akk-rust",
+    "crates/login-server",
+    "crates/shared",
+    "crates/world-server",
+    "crates/zone-server"
+]
+resolver = "2"
