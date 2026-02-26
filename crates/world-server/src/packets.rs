@@ -1,7 +1,7 @@
 use bytes::{BufMut};
 use shared::game::char_profile::CharProfilePacket;
 use shared::db::Character;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use binrw::{BinWrite, BinRead};
 
 // Constants removed in favor of shared::opcodes::OpCode
@@ -81,10 +81,11 @@ impl Default for ApproveWorld {
             0xf8,0x03,0x20,0x0a,0x56,0x8b,0xfb,0x35,0xff,0x59
         ];
         d[0..90].copy_from_slice(&magic);
-        d[192 + 12] = 0x15;
-        d[208] = 0x53;
-        d[209] = 0xC3;
-        d[528 + 12] = 0x01;
+        // Correct RoF2 Offsets from C++ client.cpp source
+        d[268] = 0x15;
+        d[280] = 0x53;
+        d[281] = 0xC3;
+        d[540] = 0x01;
         Self { data: d }
     }
 }
@@ -120,14 +121,53 @@ pub struct LogServer {
 }
 
 pub fn build_log_server() -> Vec<u8> {
-    let name = "Server".to_string();
-    let info = LogServer {
-        master_branch: name.clone(),
-        titanium: name,
-    };
-    let mut data = Cursor::new(Vec::new());
-    info.write(&mut data).unwrap();
-    data.into_inner()
+    // LogServer_Struct (RoF2) - 560 bytes
+    let mut data = Vec::with_capacity(560);
+    
+    // Fill with zeros
+    for _ in 0..560 {
+        data.put_u8(0);
+    }
+    
+    // Offsets based on rof2_structs.h and rof2.cpp ENCODE
+    // /*004*/ uint8 enable_pvp;
+    data[4] = 0; // 0 = non-pvp
+    // /*008*/ uint8 enable_FV;
+    data[8] = 0; // 0 = standard
+    
+    // rof2.cpp: eq->unknown012 = htonl(1); (Offset 12 = 00 00 00 01)
+    data[12..16].copy_from_slice(&1u32.to_be_bytes());
+    
+    // rof2.cpp: eq->unknown016 = htonl(1); (Offset 16 = 00 00 00 01)
+    data[16..20].copy_from_slice(&1u32.to_be_bytes());
+    
+    // rof2.cpp: eq->unknown020[0] = 1;
+    data[20] = 1;
+    
+    // /*036*/ char worldshortname[32];
+    let name = "Server".as_bytes();
+    let len = name.len().min(31);
+    data[36..36 + len].copy_from_slice(&name[..len]);
+    
+    // rof2.cpp unknown249 flags
+    // eq->unknown249[0] = 1; eq->unknown249[1] = 1; eq->unknown249[8] = 1; ...
+    data[249] = 1;
+    data[250] = 1;
+    data[249 + 8] = 1; // 257
+    data[249 + 9] = 1; // 258
+    data[249 + 12] = 1; // 261
+    data[249 + 14] = 1; // 263
+    data[249 + 15] = 1; // 264
+    data[249 + 16] = 1; // 265 - was missing!
+
+    // rof2.cpp: eq->unknown276[0] = 1.0f; eq->unknown276[1] = 1.0f; eq->unknown276[6] = 1.0f;
+    let f1 = 1.0f32.to_le_bytes();
+    data[276..280].copy_from_slice(&f1); // unknown276[0]
+    data[280..284].copy_from_slice(&f1); // unknown276[1]
+    // unknown276[6] = offset 276 + 6*4 = 300
+    data[300..304].copy_from_slice(&f1); // unknown276[6]
+
+    data
 }
 
 
@@ -166,10 +206,12 @@ pub struct TributeInfo {
 }
 
 pub fn build_tribute_info() -> Vec<u8> {
-    let info = TributeInfo { data: [0u8; 48] };
-    let mut data = Cursor::new(Vec::new());
-    info.write(&mut data).unwrap();
-    data.into_inner()
+    // TributeInfo_Struct (RoF2) - Exactly 3144 bytes
+    let mut data = Vec::with_capacity(3144);
+    for _ in 0..3144 {
+        data.push(0);
+    }
+    data
 }
 
 
@@ -326,7 +368,7 @@ pub struct RoF2CharacterSelectEntry {
     pub pad1: u8,
     pub last_login: u32,
     pub unknown2: u8,
-    pub pad_final: [u8; 261], // Padding to reach 602 bytes (Akk-Stack/EQEmu standard)
+    pub pad_final: [u8; 264], // Padding to reach exactly 602 bytes (Akk-Stack/EQEmu standard)
 }
 
 impl Default for RoF2CharacterSelectEntry {
@@ -343,8 +385,8 @@ impl Default for RoF2CharacterSelectEntry {
             gender: 0,
             face: 0,
             equip: [RoF2CharSelectEquip::default(); 9],
-            unknown15: 0,
-            unknown19: 0,
+            unknown15: 0xFF,
+            unknown19: 0xFF,
             drakkin_tattoo: 0,
             drakkin_details: 0,
             deity: 0,
@@ -359,11 +401,11 @@ impl Default for RoF2CharacterSelectEntry {
             go_home: 0,
             tutorial: 0,
             drakkin_heritage: 0,
-            unknown_enable: 0,
+            unknown_enable: 1,
             pad1: 0,
             last_login: 0,
             unknown2: 0,
-            pad_final: [0u8; 261],
+            pad_final: [0u8; 264],
         }
     }
 }
@@ -379,46 +421,101 @@ pub struct RoF2CharSelectEquip {
     pub color: u32, // TintStruct
 }
 
-pub fn build_char_info(chars: Vec<shared::db::Character>) -> Vec<u8> {
+pub fn build_char_info(mut chars: Vec<shared::db::Character>) -> Vec<u8> {
+    // If empty, force 1 character to test if the client crashes on 0 characters
     if chars.is_empty() {
-        return vec![0, 0, 0, 0]; // count = 0
+        chars.push(shared::db::Character {
+            id: 1,
+            account_id: 1,
+            name: "Antigravity".to_string(),
+            last_name: None,
+            zone_id: 202, // PoK
+            zone_instance: 0,
+            y: 0.0,
+            x: 0.0,
+            z: 0.0,
+            heading: 0.0,
+            gender: 0,
+            race: 1,
+            class: 1,
+            level: 50,
+            exp: 0,
+            practice_points: 0,
+            mana: 100,
+            cur_hp: 100,
+            endurance: 100,
+            str: 100,
+            sta: 100,
+            cha: 100,
+            dex: 100,
+            int: 100,
+            agi: 100,
+            wis: 100,
+            face: 1,
+            hair_style: 1,
+            hair_color: 1,
+            beard: 0,
+            beard_color: 1,
+            eye_color_1: 1,
+            eye_color_2: 1,
+            drakkin_heritage: 0,
+            drakkin_tattoo: 0,
+            drakkin_details: 0,
+            deity: 211,
+        });
     }
-    
-    let mut data = Vec::new();
+
+    let mut data = Vec::with_capacity(1024);
     let mut writer = Cursor::new(&mut data);
     
-    // 1. Write Count (u32)
+    // 1. Write Header (RoF2 CharacterSelect_Struct is just CharCount)
     let count = chars.len() as u32;
-    count.write_le(&mut writer).unwrap();
+    count.write_le(&mut writer).unwrap(); // CharCount (4 bytes)
     
-    // 2. Write Entries
+    // 2. Write Entries (Variable length: Null-terminated Name + 274 bytes of data)
     for ch in chars {
-        let mut entry = RoF2CharacterSelectEntry::default();
-        
+        // Name: Null-terminated string
         let name_bytes = ch.name.as_bytes();
-        let len = name_bytes.len().min(63);
-        entry.name[..len].copy_from_slice(&name_bytes[..len]);
+        writer.write_all(name_bytes).unwrap();
+        writer.write_all(&[0u8]).unwrap(); // Null terminator
         
-        entry.class = ch.class as u8;
-        entry.race = ch.race as u32;
-        entry.level = ch.level as u8;
-        entry.zone = 202; // PoK for safety
-        entry.gender = ch.gender as u8;
-        entry.face = ch.face as u8;
-        entry.deity = 212; // Agnostic
-        entry.hair_color = ch.hair_color as u8;
-        entry.beard_color = ch.beard_color as u8;
-        entry.eye_color_1 = ch.eye_color_1 as u8;
-        entry.eye_color_2 = ch.eye_color_2 as u8;
-        entry.hair_style = ch.hair_style as u8;
-        entry.beard = ch.beard as u8;
-        entry.go_home = 1;
-        entry.unknown_enable = 1;
-        entry.last_login = 1000;
-        entry.unknown15 = 0xFF;
-        entry.unknown19 = 0xFF;
-
-        entry.write_le(&mut writer).unwrap();
+        // Exact struct fields immediately following the name (No alignment padding!)
+        (ch.class as u8).write_le(&mut writer).unwrap(); // Class
+        (ch.race as u32).write_le(&mut writer).unwrap(); // Race
+        (ch.level as u8).write_le(&mut writer).unwrap(); // Level
+        (0u8).write_le(&mut writer).unwrap(); // ShroudClass
+        (0u32).write_le(&mut writer).unwrap(); // ShroudRace
+        (202u16).write_le(&mut writer).unwrap(); // Zone (PoK)
+        (0u16).write_le(&mut writer).unwrap(); // Instance
+        (ch.gender as u8).write_le(&mut writer).unwrap(); // Gender
+        (ch.face as u8).write_le(&mut writer).unwrap(); // Face
+        
+        // Equip[9] (9 * 24 bytes = 216 bytes)
+        for _ in 0..9 {
+            RoF2CharSelectEquip::default().write_le(&mut writer).unwrap();
+        }
+        
+        // Remaining fields (41 bytes)
+        (0xFFu8).write_le(&mut writer).unwrap(); // Unknown15
+        (0xFFu8).write_le(&mut writer).unwrap(); // Unknown19
+        (0u32).write_le(&mut writer).unwrap();  // DrakkinTattoo
+        (0u32).write_le(&mut writer).unwrap();  // DrakkinDetails
+        (212u32).write_le(&mut writer).unwrap(); // Deity (Agnostic)
+        (0u32).write_le(&mut writer).unwrap();  // PrimaryIDFile
+        (0u32).write_le(&mut writer).unwrap();  // SecondaryIDFile
+        (ch.hair_color as u8).write_le(&mut writer).unwrap(); // HairColor
+        (ch.beard_color as u8).write_le(&mut writer).unwrap(); // BeardColor
+        (ch.eye_color_1 as u8).write_le(&mut writer).unwrap(); // EyeColor1
+        (ch.eye_color_2 as u8).write_le(&mut writer).unwrap(); // EyeColor2
+        (ch.hair_style as u8).write_le(&mut writer).unwrap(); // HairStyle
+        (ch.beard as u8).write_le(&mut writer).unwrap(); // Beard
+        (1u8).write_le(&mut writer).unwrap(); // GoHome
+        (1u8).write_le(&mut writer).unwrap(); // Tutorial
+        (0u32).write_le(&mut writer).unwrap(); // DrakkinHeritage
+        (0u8).write_le(&mut writer).unwrap(); // Unknown1
+        (1u8).write_le(&mut writer).unwrap(); // Enabled
+        (1000u32).write_le(&mut writer).unwrap(); // LastLogin
+        (0u8).write_le(&mut writer).unwrap(); // Unknown2
     }
     
     data
@@ -429,45 +526,24 @@ pub fn build_char_info(chars: Vec<shared::db::Character>) -> Vec<u8> {
 // EnterWorld is handled via manual string parsing in session.rs
 
 pub fn build_expansion_info() -> Vec<u8> {
-    // RoF2 ExpansionInfo (0x590d)
-    // Structure:
-    // WindowMask (u32)
-    // ContentMask (u32)
-    // Expansion 0..23 (u32)
-    let mut data = Vec::with_capacity(100);
-    
-    // WindowMask: Enable all UI
-    data.put_u32_le(0xFFFFFFFF); 
-    
-    // ContentMask: Enable all Content features
-    data.put_u32_le(0xFFFFFFFF); 
-    
-    // Expansions: 24 u32 slots seems to be the standard array size for RoF2
-    // Some sources say 22, some 24. We'll send 24 to be safe (96 bytes + 8 = 104? No wait.)
-    // Actually, capturing RoF2 logs usually shows a fixed size.
-    // Let's assume standard EQ emu approach: 
-    // u32 WindowMask
-    // u32 ContentMask
-    // u32 Expansions[24]
-    
-    for _ in 0..24 {
-        data.put_u32_le(0xFFFFFFFF); // Enable everything
+    // EQEmu ExpansionInfo_Struct: 68 bytes
+    // 64 bytes of padding, then 4-byte bitmask at offset 64.
+    let mut data = Vec::with_capacity(68);
+    for _ in 0..64 {
+        data.put_u8(0);
     }
-    
+    data.put_u32_le(0x01FFFFFF); // All expansions through RoF2+ as required by modern clients
     data
 }
 
 
 pub fn build_membership_details() -> Vec<u8> {
-    // Membership_Details_Struct (RoF2) - Approx 1124 bytes
-    // Copied logic from client.cpp SendMembershipSettings
+    // Membership_Details_Struct (RoF2) - Exactly 1124 bytes
+    // 4 + (72 * 12) + 4 + (15 * 8) + 4 + (15 * 8) + 4 + 4 = 1124 bytes
     let mut data = Vec::with_capacity(1124);
     
-    // membership_setting_count = 66 for RoF2 (client.cpp line 330)
-    data.put_u32_le(66); 
-    
-    // Settings Logic: 22 IDs * 3 indices = 66 entries. 
-    // Wait, struct has settings[72]. Client populates 66.
+    // membership_setting_count = 72 for RoF2
+    data.put_u32_le(72); 
     
     let gold_settings: [i32; 22] = [
         -1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,-1,1,1,1,1,1,1,-1,-1,0
@@ -481,12 +557,15 @@ pub fn build_membership_details() -> Vec<u8> {
             data.put_i32_le(gold_settings[setting_id as usize]); // setting_value
         }
     }
+    
+    // Last 6 new settings fields are all 0s on Live as of 12/29/14 (Matches EQEmu rof2.cpp logic)
+    for _ in 66..72 {
+        data.put_u32_le(0); // setting_index
+        data.put_u32_le(0); // setting_id
+        data.put_i32_le(0); // setting_value
+    }
 
     // 2. Race/Class Permissions (15 each)
-    // race_entry_count
-    data.put_u32_le(15);
-    // class_entry_count
-    data.put_u32_le(15);
 
     // Arrays of MembershipEntry_Struct { purchase_id, bitwise_entry }
     // We must generate them first because the packet layout is:
@@ -543,14 +622,19 @@ pub fn build_membership_details() -> Vec<u8> {
         race_entries.push((r_purchase_id, r_bitwise));
         class_entries.push((c_purchase_id, c_bitwise));
     }
+    // race_entry_count (Offset 868)
+    data.put_u32_le(15);
 
-    // Write Races
+    // Write Races (Starts at Offset 872)
     for (pid, bit) in &race_entries {
         data.put_u32_le(*pid);
         data.put_u32_le(*bit);
     }
 
-    // Write Classes
+    // class_entry_count (Offset 992)
+    data.put_u32_le(15);
+
+    // Write Classes (Starts at Offset 996)
     for (pid, bit) in &class_entries {
         data.put_u32_le(*pid);
         data.put_u32_le(*bit);
@@ -566,18 +650,15 @@ pub fn build_membership_details() -> Vec<u8> {
 // PostEnterWorld is handled as size 0
 
 pub fn build_membership() -> Vec<u8> {
-    // Membership_Struct (RoF2) - Size 116 bytes
-    // Based on rof2.cpp ENCODE(OP_SendMembership) lines 193-217
-    // RoF2 expects: entrysize=25, 25 entries (last 4 set to 1), NO exit_url_length
-    // membership(4) + races(4) + classes(4) + entrysize(4) + entries[25](100) = 116 bytes
-    let mut data = Vec::with_capacity(116);
-    data.put_u32_le(2); // membership (Gold = 2)
-    data.put_u32_le(0xFFFFFFFF); // races (all races)
-    data.put_u32_le(0xFFFFFFFF); // classes (all classes)
-    data.put_u32_le(25); // entrysize = 25 for RoF2
+    // Membership_Struct (EQEmu) - matches client.cpp SendMembership()
+    // membership(4) + races(4) + classes(4) + entrysize(4) + entries[21](84) + exit_url_length(4) = 104 bytes
+    let mut data = Vec::with_capacity(104);
+    data.put_u32_le(2);       // membership (Gold = 2)
+    data.put_u32_le(0x1ffff); // races (all races)
+    data.put_u32_le(0x1ffff); // classes (all classes)
+    data.put_u32_le(21);      // entrysize = 21 (EQEmu standard)
     
-    // int32 entries[25] - Gold values from EQEmu client.cpp lines 298-318
-    // First 21 entries from server
+    // int32 entries[21] - Gold values from EQEmu client.cpp
     let entries: [i32; 21] = [
         -1, // 0: Max AA
         -1, // 1: Max Level
@@ -599,20 +680,15 @@ pub fn build_membership() -> Vec<u8> {
         1,  // 17: Progression
         1,  // 18: Support
         -1, // 19: Unknown
-        -1, // 20: Maximum
+        0,  // 20: Maximum
     ];
 
     for &val in entries.iter() {
         data.put_i32_le(val);
     }
     
-    // RoF2 encoding adds 4 more entries (indices 21-24) set to 1
-    // This removes "Buy Now" button from aug slots per rof2.cpp comment
-    for _ in 0..4 {
-        data.put_i32_le(1);
-    }
-    
-    // NO exit_url_length for RoF2 (that's server-side struct only)
+    // exit_url_length = 0 (no URL)
+    data.put_u32_le(0);
     
     data
 }
@@ -632,45 +708,24 @@ pub fn build_time_of_day() -> Vec<u8> {
 }
 
 pub fn build_send_zone_points() -> Vec<u8> {
-    // ZonePointsStruct (RoF2) - 0x1818
-    // Minimal impl: Just count=0 is often enough if we aren't transferring zones
-    // Struct:
-    // u32 count
-    // RoF2 ZonePoint_Struct entries[count]
-    // Structure (Based on EQEmu zone.h / common structs):
-    // float y, x, z, heading (4x4 = 16)
-    // u16 zone (2)
-    // u16 instance (2)
-    // ... padding/unknowns ...
-    // Total Size: ~72-80 bytes? 
-    // Let's try sending a minimal valid struct based on best guess:
-    // ID (u32), y, x, z, heading, zone(u16), inst(u16), target...
-    
-    // Actually, let's look at `OP_SendZonePoints` (0x3234).
-    // It's usually `count` + `ZonePoint_Struct` array.
-    
-    let mut data = Vec::with_capacity(4);
-    
-    // Count = 0 (Safe minimal packet)
+    // 8 bytes: count (u32), padding (u32)
+    let mut data = Vec::with_capacity(8);
     data.put_u32_le(0);
-    
-    println!("[PACKETS] Generated ZonePoints packet: {} bytes (Empty)", data.len());
-
+    data.put_u32_le(0);
     data
 }
 
 pub fn build_mercenary_data() -> Vec<u8> {
-    // OpCode 0x3e98 (OP_MERCENARY_DATA)
-    // Maps to MercenaryDataUpdate_Struct
-    // If we send 4 bytes of 0, `MercStatus`=0 (Active), so client expects Count + Data -> Crash/Hang.
-    // Correct "No Merc" packet:
-    // MercStatus: i32 (-1)
-    // MercCount: u32 (0)
-    let mut data = Vec::with_capacity(8);
-    data.put_i32_le(-1);
-    data.put_u32_le(0);
+    // OpCode 0x3e98 (OP_MERCENARY_DATA) -> NoMercenaryHired_Struct
+    // Fields: int32 MercStatus, uint32 MercCount, uint32 MercID
+    let mut data = Vec::with_capacity(12);
+    data.put_i32_le(-1); // MercStatus
+    data.put_u32_le(0);  // MercCount
+    data.put_u32_le(1);  // MercID (Observed as 1 in RoF2 for no merc)
     data
 }
+
+
 
 
 

@@ -34,7 +34,7 @@ impl ClientSessionActor {
         db: Arc<DatabaseManager>,
     ) -> Self {
         let mut session = SharedSession::new(session_id);
-        session.crc_key = 0xFFFFFFFF;
+        session.crc_key = 0; // Use 0 to match login-server success
         session.enable_combined();
         session.enable_compression(); // Re-enable compression (RoF2 requires it)
         
@@ -64,6 +64,9 @@ impl ClientSessionActor {
     }
 
     pub async fn handle_packet(&mut self, data: &[u8]) {
+        // Log ALL raw incoming packets for debugging
+        info!("[{}] RX RAW: len={} hex={:02X?}", self.addr, data.len(), &data[..data.len().min(40)]);
+
         match parse_eqstream(data) {
             Ok((_, pkt)) => {
                 match pkt {
@@ -71,6 +74,12 @@ impl ClientSessionActor {
                         info!("Handling Session Request in Actor for {}", self.addr);
                         let response = self.session.handle_session_request(&req);
                         self.send_raw(response).await;
+                    }
+                    EQStreamPacket::Ack(seq) => {
+                        info!("[{}] RX ACK for seq={}", self.addr, seq);
+                    }
+                    EQStreamPacket::Disconnect(reason) => {
+                        info!("[{}] RX DISCONNECT reason={}", self.addr, reason);
                     }
                     EQStreamPacket::Unknown(opcode, payload) => {
                         self.process_transport_packet(opcode, &payload).await;
@@ -116,21 +125,14 @@ impl ClientSessionActor {
                 // Do NOT send approval here. Wait for the client to identify itself (0x7a09).
             }
             OpCode::SendLoginInfo => { // 0x7a09
-                info!("[{}] Received OP_SendLoginInfo", self.addr);
+                info!("[{}] Received OP_SendLoginInfo. Hex: {:02X?}", self.addr, &decompressed[..64.min(decompressed.len())]);
                 
-                if decompressed.len() < 4 {
-                    warn!("[{}] SendLoginInfo too short ({} bytes)", self.addr, decompressed.len());
-                    return;
-                }
-
-                let account_id = u32::from_le_bytes(decompressed[0..4].try_into().unwrap_or([0;4]));
-                let session_key_data = &decompressed[4..];
-                let session_key = session_key_data.iter()
-                    .position(|&b| b == 0)
-                    .map(|pos| String::from_utf8_lossy(&session_key_data[..pos]).to_string())
-                    .unwrap_or_else(|| String::from_utf8_lossy(session_key_data).to_string());
+                let parts: Vec<&[u8]> = decompressed.split(|&b| b == 0).collect();
+                let account_id_str = parts.get(0).map(|b| String::from_utf8_lossy(b)).unwrap_or_default().to_string();
+                let session_key = parts.get(1).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+                let account_id: i32 = account_id_str.parse().unwrap_or(0);
                 
-                info!("[{}] Validating Session: AccountID={}, Key='{}'", self.addr, account_id, session_key);
+                info!("[{}] Validating Session: AccountID={} (Str='{}'), Key='{}'", self.addr, account_id, account_id_str, session_key);
 
                 match self.db.verify_session(account_id as i32, &session_key).await {
                     Ok(true) => {
@@ -243,8 +245,8 @@ impl ClientSessionActor {
                 }
             },
 
-            OpCode::ApproveWorld => { // 0x7499
-                info!("[{}] Received OP_ApproveWorld (Echo)", self.addr);
+            OpCode::ApproveWorld => { 
+                info!("[{}] Received OP_ApproveWorld (Echo) - Client handled burst.", self.addr);
             },
             
             // CRC Checksums - Must acknowledge all 3
@@ -313,11 +315,6 @@ impl ClientSessionActor {
 
                     info!("Char {} is in zone {}", name, zone_id);
                     
-                    // Write handoff for Zone Server
-                    if let Err(e) = std::fs::write("handoff.txt", format!("{}={}", self.addr.ip(), name)) {
-                        error!("Failed to write handoff.txt: {}", e);
-                    }
-
                     // IP Address: Use PUBLIC_IP for zone handoff
                     let ip_addr = std::env::var("PUBLIC_IP").unwrap_or("127.0.0.1".to_string()); 
                     let port = 7000u16;
@@ -342,55 +339,51 @@ impl ClientSessionActor {
     }
 
     async fn send_login_approval(&mut self) {
-        self.session.compression_enabled = true; // Enable compression (Golden Path: Bypass Fragmentation)
+        self.session.compression_enabled = true;
 
-        // Standard EQEmu Order: Guilds -> LogServer -> ApproveWorld
-        
-        // 1. Guilds List (Re-enabled)
+        // ===== EXACT EQEmu world/client.cpp HandleSendLoginInfoPacket sequence =====
+        // Reference: https://github.com/EQEmu/Server/blob/master/world/client.cpp
+
+        // 1. GuildsList (EQEmu sends this FIRST, before everything else)
         self.send_app_packet(OpCode::GuildsList, &packets::build_guilds_list()).await;
-        
-        // 2. Log Server (Re-enabled)
+
+        // 2. LogServer (560 bytes)
         self.send_app_packet(OpCode::LogServer, &packets::build_log_server()).await;
         
-        // 3. Approve World (Access Granted)
-        // Standard 512-byte limit applies -> Fragments naturally
+        // 3. ApproveWorld (544 bytes)
         self.send_app_packet(OpCode::ApproveWorld, &packets::build_approve_world()).await;
         
-        // 4. Expansion / Config
-        self.send_app_packet(OpCode::ExpansionInfo, &packets::build_expansion_info()).await;
+        // 4. EnterWorld — Payload: \0
+        self.send_app_packet(OpCode::EnterWorld, &[0]).await;
+
+        // 5. PostEnterWorld — Payload: []
+        self.send_app_packet(OpCode::PostEnterWorld, &[]).await;
+
+        info!("[{}] Sent Base Login Burst (Guilds, Log, Approve, Enter, PostEnter) -> Sequential Char Select.", self.addr);
         
-        // 5. RoF2 CRITICAL: MaxChars + Membership
-        self.send_app_packet(OpCode::SendMaxCharacters, &packets::build_send_max_characters()).await;
-        self.send_app_packet(OpCode::SendMembership, &packets::build_membership()).await;
-        self.send_app_packet(OpCode::SendMembershipDetails, &packets::build_membership_details()).await;
-        
-        info!("[{}] Sent Login Approval Sequence (ApproveWorld, Expansions, etc.)", self.addr);
+        // 6-10. Character selection packets (Expansion, MaxChars, Membership, Details, CharInfo)
+        self.send_character_list_sequence().await;
     }
 
     async fn send_character_list_sequence(&mut self) {
-        // Zone Points (Required for RoF2 background?)
-        self.send_app_packet(OpCode::SendZonePoints, &packets::build_send_zone_points()).await;
+        // 6. ExpansionInfo (68 bytes)
+        self.send_app_packet(OpCode::ExpansionInfo, &packets::build_expansion_info()).await;
         
-        // 7. Tribute Info (Favor)
-        self.send_app_packet(OpCode::TributeInfo, &packets::build_tribute_info()).await;
+        // 7. MaxCharacters (12 bytes) — called from SendCharInfo() in EQEmu
+        self.send_app_packet(OpCode::SendMaxCharacters, &packets::build_send_max_characters()).await;
         
-        // 8. Mercenary Data (RoF2 Expects this with expansions enabled)
-        self.send_app_packet(OpCode::MercenaryData, &packets::build_mercenary_data()).await;
+        // 8. Membership (104 bytes) — called from SendCharInfo() in EQEmu
+        self.send_app_packet(OpCode::SendMembership, &packets::build_membership()).await;
 
-        self.send_app_packet(OpCode::Motd, &packets::build_motd()).await;
-        self.send_app_packet(OpCode::TimeOfDay, &packets::build_time_of_day()).await;
-        
-        // 10. Weather (Trying to unstick client)
-        self.send_app_packet(OpCode::Weather, &packets::build_weather()).await;
-        
-        // 6. Character List (Restored DB fetch)
-        // Standard 511 limit applies -> Fragments naturally (Matches Akk Stack)
-        // Moved to LAST based on trace analysis ("TimeOfDay + Weather + SendCharInfo terminator")
+        // 9. MembershipDetails (1124 bytes) — called from SendCharInfo() in EQEmu
+        self.send_app_packet(OpCode::SendMembershipDetails, &packets::build_membership_details()).await;
+
+        // 10. Character List (OP_SendCharInfo) — the actual character data
         self.send_char_list().await;
         
-        info!("[{}] Sent Character List Sequence (CharInfo Last)", self.addr);
+        info!("[{}] Sent Character List Sequence", self.addr);
     }
-    
+
     async fn send_char_list(&mut self) {
         if self.account_id == 0 {
              warn!("[{}] send_char_list: account_id is 0, cannot fetch characters.", self.addr);
@@ -416,6 +409,10 @@ impl ClientSessionActor {
     }
     
     async fn send_app_packet(&mut self, opcode: OpCode, data: &[u8]) {
+        // Hex-dump first 40 bytes of application data for debugging
+        let preview_len = data.len().min(40);
+        info!("[{}] TX APP {:?} ({} bytes) first_bytes={:02X?}", self.addr, opcode, data.len(), &data[..preview_len]);
+        
         let packets = self.session.create_raw_packets(opcode, data);
         for pkt in &packets {
             info!("[{}] Sending packet for {:?} (len={})", self.addr, opcode, pkt.len());

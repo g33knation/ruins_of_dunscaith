@@ -35,29 +35,41 @@ pub enum EQStreamPacket {
 }
 
 #[derive(Debug, Clone, binrw::BinRead, binrw::BinWrite)]
-#[br(little)]
+#[br(big)]
 pub struct SessionRequest {
-    pub session_id: u32,
     pub protocol_version: u32,
+    pub session_id: u32,
     pub max_length: u32,
 }
 
 pub fn parse_eqstream(data: &[u8]) -> Result<(&[u8], EQStreamPacket), ProtocolError> {
-    if data.len() < 2 { return Err(ProtocolError::MalformedPayload); }
+    if data.len() < 2 { 
+        error!("parse_eqstream: Packet too short ({} bytes): {:02x?}", data.len(), data);
+        return Err(ProtocolError::MalformedPayload); 
+    }
     let opcode = u16::from_be_bytes([data[0], data[1]]);
     let payload = &data[2..];
+    
+    if opcode == 0x0001 && payload.len() < 12 {
+        error!("parse_eqstream: Malformed Op 0x0001 ({} bytes): {:02x?}", data.len(), data);
+    }
     
     match opcode {
         0x0001 => {
             if payload.len() < 12 { return Err(ProtocolError::MalformedPayload); }
-            let protocol_version = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            let session_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-            let max_length = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
-            Ok((&[], EQStreamPacket::SessionRequest(SessionRequest { session_id, protocol_version, max_length })))
+            let protocol_version = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let session_id = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let max_length = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+            Ok((&[], EQStreamPacket::SessionRequest(SessionRequest { protocol_version, session_id, max_length })))
         }
         0x0005 => {
-            if payload.len() < 4 { return Err(ProtocolError::MalformedPayload); }
-            Ok((&[], EQStreamPacket::Disconnect(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))))
+            if payload.len() < 2 { return Err(ProtocolError::MalformedPayload); }
+            let reason = if payload.len() >= 4 {
+                u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+            } else {
+                u16::from_be_bytes([payload[0], payload[1]]) as u32
+            };
+            Ok((&[], EQStreamPacket::Disconnect(reason)))
         }
         0x0015 => {
              if payload.len() < 2 { return Err(ProtocolError::MalformedPayload); }
@@ -154,21 +166,27 @@ impl EqStreamSession {
         self.session_id = req.session_id;
         info!("SessionRequest: Protocol={} SessionID={} MaxLen={}", req.protocol_version, req.session_id, req.max_length);
         
-        // Reverting to 512 (Standard). We rely on LE Fragment Fix.
-        let advertised_max = req.max_length.min(512 * 1024);
+        // Use the client's requested max_length, capped reasonably
+        let negotiated_max = req.max_length.min(512);
+        self.max_length = negotiated_max;
         self.compression_enabled = true; // Enabled for RoF2
+        
+        info!("Session negotiated: max_length={}, compression={}", self.max_length, self.compression_enabled);
         
         let mut response = Vec::with_capacity(27);
         
         response.put_u16(0x0002); // SessionResponse
-        response.put_u32_le(self.session_id);
-        response.put_u32_le(self.crc_key);
-        response.put_u8(0x02); // Flag: 2 = Compressed (Zlib)
-        response.put_u8(0x01); // Standard Unk
-        response.put_u32_le(advertised_max); 
-        response.put_u32_le(0);   
-        response.put_u32_le(131072); 
-        response.put_u32_le(4096); 
+        response.put_u32(self.session_id); // SID (BE)
+        response.put_u32(self.crc_key);    // Key (BE)
+        
+        response.put_u8(0x02); // crc_bytes (2)
+        response.put_u8(0x00); // encode_pass1
+        response.put_u8(0x00); // encode_pass2
+        
+        response.put_u32(negotiated_max); // (BE)
+        response.put_u32(0);   
+        response.put_u32(0x00020000); // 131072 (BE)
+        response.put_u32(0x00001000); // 4096 (BE)
         
         response
     }
@@ -185,13 +203,15 @@ impl EqStreamSession {
 
     fn validate_crc(&self, opcode: u16, data: &[u8]) -> bool {
         if data.len() < 2 { return false; }
-        let packet_crc = u16::from_le_bytes([data[data.len()-2], data[data.len()-1]]);
+        // Read CRC based on common protocol expectation (Try BE first as per legacy)
+        let packet_crc = u16::from_be_bytes([data[data.len()-2], data[data.len()-1]]);
         let mut digest = EQ_CRC.digest();
         
-        // The CRC is calculated over [Opcode(BE)] + [Payload] + [CRC_Key(BE)]
+        // Match eqstream_old.rs logic: Key(LE) -> Packet
+        digest.update(&self.crc_key.to_le_bytes());
+        // For validation, we need the opcode + payload (excluding the CRC itself)
         digest.update(&opcode.to_be_bytes());
-        digest.update(&data[..data.len()-2]); // Data (excluding the CRC itself)
-        digest.update(&self.crc_key.to_be_bytes()); // Key LAST (Big Endian)
+        digest.update(&data[..data.len()-2]);
         
         let crc32 = digest.finalize();
         let calced = (crc32 & 0xFFFF) as u16;
@@ -208,33 +228,33 @@ impl EqStreamSession {
         let mut results = Vec::new();
         
         // CRC Validation and Stripping
-        // If Key is 0, assume No CRC (Common in Login Server / RoF2 Discovery)
-        let checked_payload = if self.crc_key != 0 {
-            if payload.len() >= 2 {
-                 if !self.validate_crc(opcode, payload) {
-                     warn!("CRC Validation Failed for Op {:04x}", opcode);
-                     // return Ok(vec![]); // Logic: Drop? Or try processing anyway?
-                 }
-                 &payload[..payload.len()-2]
-            } else {
-                 payload
-            }
-        } else {
-            // Key is 0: Assume No CRC appended by client
-            payload
-        };
+        // Liberal approach: Only strip if it actually validates as a CRC.
+        // This handles clients that omit CRCs on some packets (common in RoF2).
+        let mut checked_payload = payload;
+        if payload.len() >= 2 {
+             if self.validate_crc(opcode, payload) {
+                 checked_payload = &payload[..payload.len()-2];
+             } else {
+                 // warn!("CRC Validation Failed for Op {:04x}. Proceeding without stripping.", opcode);
+             }
+        }
+
+        // If the payload is empty after stripping CRC, it might be an empty packet (KeepAlive)
+        // Some clients send `00 09` with no sequence number as an empty sequenced packet or keepalive.
+        // We need to handle this correctly.
 
         match opcode {
             0x09 => { // OP_Packet (Sequenced)
+                // If the client sent ONLY the opcode and CRC (checked_payload.len == 0),
+                // it acts as a KeepAlive or empty probe packet. We can just return an Ack for last seq.
+                if checked_payload.is_empty() {
+                    info!("Received Empty OP_Packet (KeepAlive), sending Ack for last sequence.");
+                    results.push(ProcessPacketResult::Response(self.create_ack(self.last_received_sequence)));
+                    return Ok(results);
+                }
+
                 if checked_payload.len() < 2 { return Err(ProtocolError::MalformedPayload); }
                 let sequence = u16::from_be_bytes([checked_payload[0], checked_payload[1]]);
-                
-                // Auto-Sync ISN on first packet
-                if self.packets_received == 0 {
-                     // If client starts at random seq (e.g. 0x1907), accept it.
-                     self.last_received_sequence = sequence.wrapping_sub(1);
-                     info!("Auto-Synced Initial Sequence to {}", sequence);
-                }
 
                 let next_seq = self.last_received_sequence.wrapping_add(1);
                 
@@ -309,7 +329,11 @@ impl EqStreamSession {
                 if payload.len() >= 2 {
                     let seq = u16::from_be_bytes([payload[0], payload[1]]);
                     if let Some(p) = self.sent_packets.get(&seq) {
+                        info!("OP_OutOfOrder: Retransmitting seq {} ({} bytes)", seq, p.len());
                         results.push(ProcessPacketResult::Response(p.clone()));
+                    } else {
+                        warn!("OP_OutOfOrder: No stored packet for seq {}. sent_packets has {} entries: {:?}", 
+                            seq, self.sent_packets.len(), self.sent_packets.keys().collect::<Vec<_>>());
                     }
                 }
             },
@@ -323,11 +347,7 @@ impl EqStreamSession {
         let mut offset = 0;
         
         while offset < payload.len() {
-            let len = if opcode == 0x19 {
-                payload[offset] as usize
-            } else {
-                payload[offset] as usize
-            };
+            let len = payload[offset] as usize;
             offset += 1;
             
             if offset + len > payload.len() { break; }
@@ -335,9 +355,11 @@ impl EqStreamSession {
             offset += len;
             
             if sub.len() >= 2 {
-                let sub_op_raw = u16::from_le_bytes([sub[0], sub[1]]);
-                let sub_op = OpCode::from_u16(sub_op_raw).unwrap_or(OpCode::Unknown);
-                results.push(ProcessPacketResult::Application(sub_op, sub[2..].to_vec()));
+                // OP_Combined contains EQStream packets, not Application packets directly
+                let sub_op = u16::from_be_bytes([sub[0], sub[1]]);
+                if let Ok(res) = self.process_packet_internal(sub_op, &sub[2..]) {
+                    results.extend(res);
+                }
             }
         }
         results
@@ -384,38 +406,32 @@ impl EqStreamSession {
     }
 
     pub fn create_raw_packets(&mut self, app_opcode: OpCode, data: &[u8]) -> Vec<Vec<u8>> {
-        let mut payload = data.to_vec();
-        
-        if app_opcode == OpCode::SendCharInfo { // OP_SendCharInfo (0x00d2)
-             info!("create_raw_packets: OP_SendCharInfo (0x00d2). data.len()={}, compression_enabled={}", data.len(), self.compression_enabled);
-        }
+        let mut uncompressed_app_layer = Vec::with_capacity(data.len() + 2);
+        uncompressed_app_layer.put_u16_le(app_opcode as u16);
+        uncompressed_app_layer.put_slice(data);
 
-        // Catch-all for large packets to see if compression logic is triggering
-        if data.len() > 250 {
-             info!("create_raw_packets: Large Packet (Opcode {:?}). data.len()={}, compression_enabled={}", app_opcode, data.len(), self.compression_enabled);
-        }
+        let mut app_layer = uncompressed_app_layer.clone();
 
-        if self.compression_enabled && data.len() >= 100 {
+        if self.compression_enabled && uncompressed_app_layer.len() >= 512 {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-            if encoder.write_all(data).is_ok() {
+            if encoder.write_all(&uncompressed_app_layer).is_ok() {
                 if let Ok(compressed) = encoder.finish() {
                     let mut comp_layer = Vec::with_capacity(6 + compressed.len());
+                    // EQ compression signature
                     comp_layer.push(0x5a);
                     comp_layer.push(0x00);
-                    comp_layer.put_u32_le(data.len() as u32);
+                    comp_layer.put_u32_le(uncompressed_app_layer.len() as u32);
                     comp_layer.extend_from_slice(&compressed);
-                    payload = comp_layer;
+                    
+                    app_layer = comp_layer;
                 }
             }
         }
-
-        let mut app_layer = Vec::with_capacity(payload.len() + 2);
-        app_layer.put_u16_le(app_opcode as u16);
-        app_layer.put_slice(&payload);
         
-        let _max_app_payload = (self.max_length as usize).saturating_sub(6);
+        // EQ protocol: actual max packet size is max_length - 1 (akk-stack sends 511, not 512)
+        let effective_max = (self.max_length as usize).saturating_sub(1);
         
-        let max_sequenced = (self.max_length as usize).saturating_sub(6);
+        let max_sequenced = effective_max.saturating_sub(6); // 6 = opcode(2) + seq(2) + crc(2)
         if app_layer.len() <= max_sequenced {
             let mut packet = Vec::with_capacity(6 + app_layer.len());
             packet.put_u8(0x00);
@@ -438,18 +454,20 @@ impl EqStreamSession {
         
         while offset < app_layer.len() {
             let is_first = offset == 0;
-            let header_size = if is_first { 8 } else { 4 };
-            let chunk_size = (self.max_length as usize).saturating_sub(header_size + 2).min(app_layer.len() - offset);
+            let header_size = if is_first { 8 } else { 4 }; // 8 = opcode(2)+seq(2)+totallen(4), 4 = opcode(2)+seq(2)
+            let chunk_size = effective_max.saturating_sub(header_size + 2).min(app_layer.len() - offset); // 2 = CRC
             
             let mut packet = Vec::with_capacity(header_size + chunk_size + 2);
             packet.put_u8(0x00);
             packet.put_u8(0x0d);
             let seq = self.sequence_out;
             self.sequence_out = self.sequence_out.wrapping_add(1);
-            if is_first { packet.put_u32(total_len); } // Big Endian (Standard)
+            packet.put_u16(seq); // Sequence number (Big Endian)
+            if is_first { packet.put_u32(total_len); } // Total length (Big Endian)
             packet.put_slice(&app_layer[offset..offset + chunk_size]);
             offset += chunk_size;
             self.append_crc(&mut packet);
+            info!("Fragment seq={}: first_20={:02X?}, total_len={}", seq, &packet[..20.min(packet.len())], packet.len());
             self.sent_packets.insert(seq, packet.clone());
             self.packets_sent += 1;
             fragments.push(packet);
@@ -458,14 +476,14 @@ impl EqStreamSession {
     }
 
     pub fn append_crc(&self, packet: &mut Vec<u8>) {
-        if self.crc_key != 0 {
-            let mut digest = EQ_CRC.digest();
-            digest.update(packet); // Data FIRST
-            digest.update(&self.crc_key.to_be_bytes()); // Key LAST (Big Endian)
-            let crc32 = digest.finalize();
-            // EQStream uses LITTLE-ENDIAN for the 16-bit CRC!
-            packet.put_u16_le((crc32 & 0xFFFF) as u16);
-        }
+        let mut digest = EQ_CRC.digest();
+        // Match eqstream_old.rs order: Key(LE) -> Data
+        digest.update(&self.crc_key.to_le_bytes()); 
+        digest.update(packet); 
+        let crc32 = digest.finalize();
+        let crc16 = (crc32 & 0xFFFF) as u16;
+        // Match eqstream_old.rs BE CRC
+        packet.put_u16(crc16);
     }
 
     pub fn create_ack(&self, sequence: u16) -> Vec<u8> {
