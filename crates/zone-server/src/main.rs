@@ -26,10 +26,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     // ... (DB Connect)
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let pool = PgPoolOptions::new().max_connections(5).connect(&database_url).await?;
-    let _pool = Arc::new(pool.clone()); // Clone to keep 'pool' available
-    log::info!("Zone Server connected to DB.");
+    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "stub".to_string());
+    let pool = if database_url == "stub" {
+        log::info!("Zone Server running in STUB mode.");
+        None
+    } else {
+        let p = PgPoolOptions::new().max_connections(5).connect(&database_url).await?;
+        log::info!("Zone Server connected to DB.");
+        Some(p)
+    };
 
     // --- Zone Key Manager ---
     let (key_manager, key_tx) = ZoneKeyManager::new(pool.clone());

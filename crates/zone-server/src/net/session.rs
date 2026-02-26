@@ -9,10 +9,18 @@ use crate::net::key_manager::KeyManagerRequest;
 use crate::net::client_socket::{InboundPacket, OutboundPacket};
 use shared::net::eq_stream::{parse_eqstream, EQStreamPacket, EqStreamSession as SharedSession, ProcessPacketResult};
 use shared::opcodes::OpCode;
-use shared::packets::{TargetMouse, CombatDamage, ChannelMessage, MerchantClick, MerchantBuy, MerchantSell, MerchantList};
+use shared::packets::{
+    TargetMouse, CombatDamage, ChannelMessage, MerchantClick, MerchantBuy, 
+    MerchantSell, MerchantList, BeginCast, CastSpell, InterruptCast, ActionPacket,
+    ZoneEntryResponse,
+};
 use crate::game::world::{Position, EntityId, WorldEvent, WorldCommand};
 use crate::game::merchant::MerchantItem;
+use crate::game::spells::SpellManager;
 use anyhow::Result;
+use serde::Deserialize;
+use serde_json::json;
+use sqlx::Row;
 
 #[derive(sqlx::FromRow, Debug, Clone)]
 struct CharacterDbData {
@@ -75,7 +83,7 @@ use crate::game::inventory::InventoryRequest;
 
 pub struct ClientSystem {
     addr: SocketAddr,
-    db_pool: sqlx::PgPool,
+    db_pool: Option<sqlx::PgPool>,
     key_tx: mpsc::Sender<KeyManagerRequest>,
     inv_tx: mpsc::Sender<InventoryRequest>,
     world_tx: mpsc::Sender<WorldCommand>,
@@ -107,12 +115,22 @@ pub struct ClientSystem {
     // Combat
     target_id: Option<u32>,
     auto_attack: bool,
+    spell_manager: SpellManager,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action")]
+enum GmAction {
+    #[serde(rename = "spawn")]
+    Spawn { npc_id: i32, x: Option<f32>, y: Option<f32>, z: Option<f32> },
+    #[serde(rename = "teleport")]
+    Teleport { x: f32, y: f32, z: f32 },
 }
 
 impl ClientSystem {
     pub fn new(
         addr: SocketAddr,
-        db_pool: sqlx::PgPool,
+        db_pool: Option<sqlx::PgPool>,
         key_tx: mpsc::Sender<KeyManagerRequest>,
         inv_tx: mpsc::Sender<InventoryRequest>,
         world_tx: mpsc::Sender<WorldCommand>,
@@ -151,6 +169,7 @@ impl ClientSystem {
             spawn_id_to_entity_id: std::collections::HashMap::new(),
             target_id: None,
             auto_attack: false,
+            spell_manager: SpellManager::new(),
         }
     }
 
@@ -158,9 +177,16 @@ impl ClientSystem {
         log::info!("Zone ClientSystem (Logic) started for {}", self.addr);
         let mut visibility_interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
         let mut combat_interval = tokio::time::interval(tokio::time::Duration::from_millis(1500));
+        let mut spell_interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
         
         loop {
             tokio::select! {
+                _ = spell_interval.tick() => {
+                    if let Some(spell_id) = self.spell_manager.check_completion() {
+                        log::info!("Spell {} casting complete!", spell_id);
+                        self.handle_spell_completion(spell_id).await;
+                    }
+                }
                 Some(packet) = self.rx_inbound.recv() => {
                     match packet {
                         InboundPacket::Raw(data) => {
@@ -187,6 +213,7 @@ impl ClientSystem {
         }
     }
 
+
     async fn handle_world_event(&mut self, event: WorldEvent) {
         match event {
             WorldEvent::ChatMessage { sender_name, channel, message, .. } => {
@@ -201,12 +228,10 @@ impl ClientSystem {
                     message: [0; 256],
                 };
 
-                // Copy sender name
                 let sender_bytes = sender_name.as_bytes();
                 let slen = std::cmp::min(sender_bytes.len(), 64);
                 for i in 0..slen { cm.sender[i] = sender_bytes[i] as i8; }
 
-                // Copy message
                 let msg_bytes = message.as_bytes();
                 let mlen = std::cmp::min(msg_bytes.len(), 256);
                 for i in 0..mlen { cm.message[i] = msg_bytes[i] as i8; }
@@ -216,6 +241,10 @@ impl ClientSystem {
                 if let Ok(_) = cm.write(&mut cursor) {
                     self.send_app_packet(OpCode::ChannelMessage, &payload).await;
                 }
+            }
+            WorldEvent::Teleport { pos } => {
+                self.pos = pos;
+                log::info!("Client {} teleported to {:?}", self.addr, pos);
             }
         }
     }
@@ -286,6 +315,8 @@ impl ClientSystem {
             OpCode::ShopBuy => self.handle_shop_buy(&decompressed).await,
             OpCode::ShopSell => self.handle_shop_sell(&decompressed).await,
             OpCode::ShopEnd => log::info!("Shop End from {}", self.addr),
+            OpCode::CastSpell => self.handle_cast_spell(&decompressed).await,
+            OpCode::InterruptCast => self.handle_interrupt_cast(&decompressed).await,
             _ => log::info!("ClientSystem {} ignored AppOpCode {:?} (Len={})", self.addr, app_opcode, decompressed.len()),
         }
     }
@@ -301,11 +332,80 @@ impl ClientSystem {
 
             if cm.channel == 1 { // Say
                 if let Some(source_id) = self.entity_id {
-                    let _ = self.world_tx.send(WorldCommand::BroadcastChatMessage {
-                        source_id,
-                        channel: cm.channel,
-                        message,
-                    }).await;
+                    if message.starts_with("/ai ") {
+                        let prompt = message[4..].to_string();
+                        log::info!("AI Command from {}: {}", self.addr, prompt);
+                        
+                        // Make AI call non-blocking by spawning a task
+                        let world_tx = self.world_tx.clone();
+                        let char_id = self.char_id.unwrap_or(0);
+                        let pos = self.pos;
+                        
+                        tokio::spawn(async move {
+                            let client = reqwest::Client::new();
+                            let system_prompt = "You are the GameMaster. You can command the world using JSON blocks.\n\
+                                Spawning: ```json {\"action\": \"spawn\", \"npc_id\": ID} ```\n\
+                                Teleporting: ```json {\"action\": \"teleport\", \"x\": X, \"y\": Y, \"z\": Z} ```";
+                            
+                            let payload = json!({
+                                "message": format!("{}\n\nUser: {}", system_prompt, prompt),
+                                "session_id": char_id.to_string(),
+                            });
+                            
+                            let ai_msg = match client.post("http://127.0.0.1:8080/v1/chat").json(&payload).send().await {
+                                Ok(res) => {
+                                    if let Ok(json) = res.json::<serde_json::Value>().await {
+                                        json["choices"][0]["message"]["content"].as_str().unwrap_or("No response").to_string()
+                                    } else { "AI Error: Parse failed".to_string() }
+                                },
+                                Err(e) => format!("AI Error: {}", e),
+                            };
+                            
+                            // Extract and execute actions
+                            if let Some(start) = ai_msg.find("```json") {
+                                if let Some(end) = ai_msg[start..].find("```") {
+                                    let json_part = &ai_msg[start + 7..start + end].trim();
+                                    if let Ok(action) = serde_json::from_str::<GmAction>(json_part) {
+                                        match action {
+                                            GmAction::Spawn { npc_id, x, y, z } => {
+                                                let spawn_pos = Position {
+                                                    x: x.unwrap_or(pos.x),
+                                                    y: y.unwrap_or(pos.y),
+                                                    z: z.unwrap_or(pos.z),
+                                                    heading: pos.heading,
+                                                };
+                                                let _ = world_tx.send(WorldCommand::SpawnNpc { npc_type_id: npc_id, pos: spawn_pos }).await;
+                                            }
+                                            GmAction::Teleport { x, y, z } => {
+                                                let new_pos = Position { x, y, z, heading: pos.heading };
+                                                let _ = world_tx.send(WorldCommand::TeleportEntity { id: source_id, pos: new_pos }).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Clean msg for broadcast (remove JSON block)
+                            let clean_msg = if let Some(start) = ai_msg.find("```json") {
+                                ai_msg[..start].to_string()
+                            } else {
+                                ai_msg.clone()
+                            };
+
+                            let _ = world_tx.send(WorldCommand::BroadcastChatMessage {
+                                source_id,
+                                channel: cm.channel,
+                                message: format!("[GameMaster] {}", clean_msg.trim()), 
+                            }).await;
+                        });
+                        
+                    } else {
+                        let _ = self.world_tx.send(WorldCommand::BroadcastChatMessage {
+                            source_id,
+                            channel: cm.channel,
+                            message,
+                        }).await;
+                    }
                 }
             }
         }
@@ -383,6 +483,11 @@ impl ClientSystem {
                 damage_type: 0, // Melee
                 spell_id: 0,
                 damage: damage as i32,
+                force: 0.0,
+                hit_heading: 0.0,
+                hit_pitch: 0.0,
+                secondary: 0,
+                special: 0,
             };
             
             let mut payload = Vec::new();
@@ -458,39 +563,51 @@ impl ClientSystem {
 
         log::info!("ClientSystem {} entering as Character '{}'", self.addr, char_name);
 
-        let char_data_res = sqlx::query_as::<_, CharacterDbData>(
-            "SELECT cd.*, cc.platinum, cc.gold, cc.silver, cc.copper FROM character_data cd \
-             LEFT JOIN character_currency cc ON cd.id = cc.id WHERE cd.name = $1"
-        )
-        .bind(&char_name)
-        .fetch_optional(&self.db_pool)
-        .await;
-
-        match char_data_res {
+        match self.fetch_character(&char_name).await {
             Ok(Some(c)) => {
                 self.process_character_entry(c.clone(), &c.name).await;
             },
-            Ok(None) => {
-                // Fallback: Character name parsing failed, try to find the most recent character
-                log::warn!("Character '{}' not found, trying fallback lookup...", char_name);
-                
-                let fallback_res = sqlx::query_as::<_, CharacterDbData>(
-                    "SELECT cd.*, cc.platinum, cc.gold, cc.silver, cc.copper FROM character_data cd \
-                     LEFT JOIN character_currency cc ON cd.id = cc.id ORDER BY cd.last_login DESC LIMIT 1"
-                )
-                .fetch_optional(&self.db_pool)
-                .await;
-                
-                match fallback_res {
-                    Ok(Some(c)) => {
-                        log::info!("Fallback found character: '{}'", c.name);
-                        self.process_character_entry(c.clone(), &c.name).await;
-                    },
-                    Ok(None) => log::error!("No characters exist in database!"),
-                    Err(e) => log::error!("DB Error in fallback lookup: {}", e),
-                }
-            },
+            Ok(None) => log::error!("Character '{}' not found and fallback failed.", char_name),
             Err(e) => log::error!("DB Error fetching character '{}': {}", char_name, e),
+        }
+    }
+    
+    async fn fetch_character(&self, char_name: &str) -> Result<Option<CharacterDbData>, sqlx::Error> {
+        if self.db_pool.is_none() {
+            log::info!("MOCK: Bypass DB lookup for character '{}'", char_name);
+            return Ok(Some(CharacterDbData {
+                id: 1, account_id: 1, name: char_name.to_string(), last_name: "".to_string(),
+                level: 60, race: 1, class: 1, gender: 0, deity: 1, zone_id: 202, zone_instance: 0,
+                x: -326.0, y: 0.0, z: -16.0, heading: 0.0, face: 0, hair_color: 0, hair_style: 0,
+                beard: 0, beard_color: 0, eye_color_1: 0, eye_color_2: 0, drakkin_heritage: 0,
+                drakkin_tattoo: 0, drakkin_details: 0, str: 75, sta: 75, dex: 75, agi: 75, int: 75,
+                wis: 75, cha: 75, cur_hp: 100, mana: 100, endurance: 100, intoxication: 0,
+                toxicity: 0, hunger_level: 100, thirst_level: 100, exp: 0, aa_points_spent: 0,
+                aa_exp: 0, aa_points: 0, points: 0, air_remaining: 100, show_helm: 1,
+                rest_timer: 0, platinum: 100, gold: 0, silver: 0, copper: 0,
+            }));
+        }
+
+        let pool = self.db_pool.as_ref().unwrap();
+        let res = sqlx::query_as::<_, CharacterDbData>(
+            "SELECT cd.*, cc.platinum, cc.gold, cc.silver, cc.copper FROM character_data cd \
+             LEFT JOIN character_currency cc ON cd.id = cc.id WHERE cd.name = $1"
+        )
+        .bind(char_name)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(c) = res {
+            Ok(Some(c))
+        } else {
+            // Fallback
+            log::warn!("Character '{}' not found, trying fallback lookup...", char_name);
+            sqlx::query_as::<_, CharacterDbData>(
+                "SELECT cd.*, cc.platinum, cc.gold, cc.silver, cc.copper FROM character_data cd \
+                 LEFT JOIN character_currency cc ON cd.id = cc.id ORDER BY cd.last_login DESC LIMIT 1"
+            )
+            .fetch_optional(pool)
+            .await
         }
     }
     
@@ -549,35 +666,21 @@ impl ClientSystem {
 
     async fn send_zone_entry_response(&mut self, c: CharacterDbData, entity_id: u32) {
          log::info!("Sending OP_ZoneEntry (Response) - OpCode::ZoneEntry");
-         // The OP_ZoneEntry (Response) in RoF2 is a Spawn_Struct.
-         let mut payload = vec![0u8; 2048];
+         let mut response = ZoneEntryResponse::default();
          
-         // 0000: Name (64 bytes)
          let name = c.name.as_bytes();
          let len = std::cmp::min(name.len(), 64);
-         payload[0..len].copy_from_slice(&name[..len]);
+         response.name[..len].copy_from_slice(&name[..len]);
+         response.entity_id = entity_id;
+         response.level = c.level as u8;
+         response.npc = 0;
+         response.stand_state = 100;
          
-         // 0064: SpawnID (u32)
-         let spawn_id_bytes = entity_id.to_le_bytes();
-         payload[64..68].copy_from_slice(&spawn_id_bytes);
-
-         // 0068: Level (u8)
-         payload[68] = c.level as u8;
-
-         // 0073: NPC (u8) - 0 for Player
-         payload[73] = 0;
-         
-         // 0126: StandState (u8) - 100 for Standing
-         payload[126] = 100;
-
-         // Position data (Spawn_Struct has a complex bitfield, but simple floats often work in older versions
-         // or specific offsets in RoF2)
-         // RoF2 Spawn_Struct_Position is bitpacked, but let's try some common offsets first.
-         // Wait, according to rof2_structs.h, Position is at offset 479... no, offset 429 is spawn struct.
-         // Position is usually around 489.
-         
-         // Sending as 0x5089 (OP_ZoneEntry)
-         self.send_app_packet(OpCode::ZoneEntry, &payload).await;
+         let mut payload = Vec::new();
+         let mut cursor = Cursor::new(&mut payload);
+         if let Ok(_) = response.write(&mut cursor) {
+             self.send_app_packet(OpCode::ZoneEntry, &payload).await;
+         }
     }
 
 
@@ -645,6 +748,10 @@ impl ClientSystem {
     }
 
     async fn save_character(&self) {
+        if self.db_pool.is_none() {
+            log::info!("MOCK: Skipping character save for {:?}", self.char_id);
+            return;
+        }
         if let Some(char_id) = self.char_id {
             log::info!("Saving Character {}", char_id);
             let res = sqlx::query(
@@ -659,7 +766,7 @@ impl ClientSystem {
             .bind(self.level as i32)
             .bind(self.exp)
             .bind(char_id)
-            .execute(&self.db_pool)
+            .execute(self.db_pool.as_ref().unwrap())
             .await;
 
             if let Err(e) = res { log::error!("Failed to save character {}: {}", char_id, e); }
@@ -975,45 +1082,49 @@ impl ClientSystem {
                             let new_copper = new_total % 10;
 
                             if let Some(char_id) = self.char_id {
-                                let res = sqlx::query(
-                                    "UPDATE character_currency SET platinum = $1, gold = $2, silver = $3, copper = $4 WHERE id = $5"
-                                )
-                                .bind(new_plat as i32)
-                                .bind(new_gold as i32)
-                                .bind(new_silver as i32)
-                                .bind(new_copper as i32)
-                                .bind(char_id)
-                                .execute(&self.db_pool)
-                                .await;
-
-                                if let Ok(_) = res {
-                                    // 2. Add item to inventory
-                                    let inv_res = sqlx::query(
-                                        "INSERT INTO inventory_items (char_id, item_id, slot_id, quantity) \
-                                         VALUES ($1, $2, (SELECT COALESCE(MAX(slot_id), 22) + 1 FROM inventory_items WHERE char_id = $1), $3)"
+                                if self.db_pool.is_none() {
+                                    log::info!("MOCK: Bypass currency update for char {}", char_id);
+                                } else {
+                                    let res = sqlx::query(
+                                        "UPDATE character_currency SET platinum = $1, gold = $2, silver = $3, copper = $4 WHERE id = $5"
                                     )
+                                    .bind(new_plat as i32)
+                                    .bind(new_gold as i32)
+                                    .bind(new_silver as i32)
+                                    .bind(new_copper as i32)
                                     .bind(char_id)
-                                    .bind(item_id as i32)
-                                    .bind(buy.quantity as i16)
-                                    .execute(&self.db_pool)
+                                    .execute(self.db_pool.as_ref().unwrap())
                                     .await;
 
-                                    if let Ok(_) = inv_res {
-                                        // Update local state and notify client
-                                        self.platinum = new_plat as i32;
-                                        self.gold = new_gold as i32;
-                                        self.silver = new_silver as i32;
-                                        self.copper = new_copper as i32;
-                                        
-                                        // Send MoneyUpdate (OP_MoneyUpdate = 0x4859)
-                                        let mut money_buf = vec![0u8; 16];
-                                        money_buf[0..4].copy_from_slice(&(self.platinum as u32).to_le_bytes());
-                                        money_buf[4..8].copy_from_slice(&(self.gold as u32).to_le_bytes());
-                                        money_buf[8..12].copy_from_slice(&(self.silver as u32).to_le_bytes());
-                                        money_buf[12..16].copy_from_slice(&(self.copper as u32).to_le_bytes());
-                                        self.send_app_packet(OpCode::MoneyUpdate, &money_buf).await;
-                                        
-                                        log::info!("Item {} purchased successfully.", item_id);
+                                    if let Ok(_) = res {
+                                        // 2. Add item to inventory
+                                        let inv_res = sqlx::query(
+                                            "INSERT INTO inventory_items (char_id, item_id, slot_id, quantity) \
+                                             VALUES ($1, $2, (SELECT COALESCE(MAX(slot_id), 22) + 1 FROM inventory_items WHERE char_id = $1), $3)"
+                                        )
+                                        .bind(char_id)
+                                        .bind(item_id as i32)
+                                        .bind(buy.quantity as i16)
+                                        .execute(self.db_pool.as_ref().unwrap())
+                                        .await;
+
+                                        if let Ok(_) = inv_res {
+                                            // Update local state and notify client
+                                            self.platinum = new_plat as i32;
+                                            self.gold = new_gold as i32;
+                                            self.silver = new_silver as i32;
+                                            self.copper = new_copper as i32;
+                                            
+                                            // Send MoneyUpdate (OP_MoneyUpdate = 0x4859)
+                                            let mut money_buf = vec![0u8; 16];
+                                            money_buf[0..4].copy_from_slice(&(self.platinum as u32).to_le_bytes());
+                                            money_buf[4..8].copy_from_slice(&(self.gold as u32).to_le_bytes());
+                                            money_buf[8..12].copy_from_slice(&(self.silver as u32).to_le_bytes());
+                                            money_buf[12..16].copy_from_slice(&(self.copper as u32).to_le_bytes());
+                                            self.send_app_packet(OpCode::MoneyUpdate, &money_buf).await;
+                                            
+                                            log::info!("Item {} purchased successfully.", item_id);
+                                        }
                                     }
                                 }
                             }
@@ -1034,18 +1145,21 @@ impl ClientSystem {
             log::info!("Shop SELL Request: NPC SpawnID {}, ItemSlot {}, Qty {}, Price {}", sell.npc_id, sell.item_slot, sell.quantity, sell.price);
             
             if let Some(char_id) = self.char_id {
+                if self.db_pool.is_none() {
+                    log::info!("MOCK: Bypass inventory check for sale");
+                    // Mock item_id if needed, but for now just mock the profit logic
+                    return; 
+                }
                 // 1. Find item_id in inventory
-                let item_res = sqlx::query!(
-                    "SELECT item_id FROM inventory_items WHERE char_id = $1 AND slot_id = $2 LIMIT 1",
-                    char_id,
-                    sell.item_slot as i16
-                )
-                .fetch_optional(&self.db_pool)
-                .await;
-
+                let item_res = sqlx::query("SELECT item_id FROM inventory_items WHERE char_id = $1 AND slot_id = $2 LIMIT 1")
+                    .bind(char_id)
+                    .bind(sell.item_slot as i16)
+                    .fetch_optional(self.db_pool.as_ref().unwrap())
+                    .await;
+                
                 match item_res {
                     Ok(Some(row)) => {
-                        let item_id = row.item_id;
+                        let item_id: i32 = row.get("item_id");
                         
                         if let Some(&npc_entity_id) = self.spawn_id_to_entity_id.get(&sell.npc_id) {
                             let (tx, rx) = oneshot::channel();
@@ -1072,7 +1186,7 @@ impl ClientSystem {
                                     )
                                     .bind(char_id)
                                     .bind(sell.item_slot as i16)
-                                    .execute(&self.db_pool)
+                                    .execute(self.db_pool.as_ref().unwrap())
                                     .await;
 
                                     if let Ok(_) = del_res {
@@ -1093,7 +1207,7 @@ impl ClientSystem {
                                         .bind(new_silver as i32)
                                         .bind(new_copper as i32)
                                         .bind(char_id)
-                                        .execute(&self.db_pool)
+                                        .execute(self.db_pool.as_ref().unwrap())
                                         .await;
 
                                         if let Ok(_) = money_res {
@@ -1125,4 +1239,121 @@ impl ClientSystem {
             }
         }
     }
+
+    async fn handle_cast_spell(&mut self, payload: &[u8]) {
+        let mut cursor = Cursor::new(payload);
+        if let Ok(cast) = CastSpell::read(&mut cursor) {
+            log::info!("Client requested cast: SpellID={} GemSlot={}", cast.spell_id, cast.gem_slot);
+            
+            // 1. Initial validation (is player dead? stunned? moving? Already casting?)
+            if self.spell_manager.is_casting() {
+                log::warn!("Player is already casting. Ignoring new cast request.");
+                return;
+            }
+
+            // 2. Lookup spell data (hardcoded for now, basic 2.5 second cast time)
+            let cast_time = 2500; 
+            
+            // 3. Inform client to start cast bar
+            self.send_begin_cast(cast.spell_id, cast_time, cast.target_id).await;
+            
+            // 4. Update state
+            self.spell_manager.start_cast(cast.spell_id, cast_time, cast.target_id);
+        }
+    }
+
+    async fn handle_interrupt_cast(&mut self, _payload: &[u8]) {
+        log::info!("Client requested interrupt!");
+        self.spell_manager.interrupt();
+    }
+
+    async fn handle_spell_completion(&mut self, spell_id: u32) {
+        log::info!("Commencing spell effects for {}", spell_id);
+        
+        let target_id = self.spell_manager.current_target().unwrap_or(0);
+        let caster_id = self.entity_id.map(|e| (e.data().as_ffi() as u32) as u16).unwrap_or(0);
+
+        // 1. Send OP_Action to trigger visual effects (particles, flinching)
+        let action = ActionPacket {
+            target_id: target_id as u16,
+            source_id: caster_id,
+            level: 1, // Placeholder caster level
+            unknown06: 0,
+            instrument_mod: 10.0,
+            force: 0.0,
+            hit_heading: 0.0,
+            hit_pitch: 0.0,
+            action_type: 0xE7, // Spell action type
+            damage: 100, // Placeholder damage amount for effect sizing
+            unknown31: 0,
+            spell_id,
+            spell_level: 1,
+            effect_flag: 4, // 4 indicates a valid effect
+        };
+
+        log::debug!("Sending OP_Action for spell completion: {:?}", action);
+        let mut action_payload = Vec::new();
+        let mut cursor = Cursor::new(&mut action_payload);
+        if let Ok(_) = action.write(&mut cursor) {
+            self.send_app_packet(OpCode::Action, &action_payload).await;
+            
+            // OP_Action often pairs with OP_Action2 in RoF2 for buff blocking/additional info
+            self.send_app_packet(OpCode::Action2, &action_payload).await;
+        }
+
+        // 2. Send OP_Damage to display the text message and apply actual health changes
+        let dmg_amount = 100; // Hardcoded 100 direct damage for Phase 23 
+        
+        let combat_damage = CombatDamage {
+            target_id: target_id as u16,
+            source_id: caster_id,
+            damage_type: 0xE7, // Spell damage
+            spell_id,
+            damage: dmg_amount,
+            force: 0.0,
+            hit_heading: 0.0,
+            hit_pitch: 0.0,
+            secondary: 0,
+            special: 0,
+        };
+
+        log::debug!("Sending OP_Damage for spell hit: {:?}", combat_damage);
+        let mut dmg_payload = Vec::new();
+        let mut dmg_cursor = Cursor::new(&mut dmg_payload);
+        if let Ok(_) = combat_damage.write(&mut dmg_cursor) {
+            self.send_app_packet(OpCode::Damage, &dmg_payload).await;
+        }
+
+        // 3. Apply actual HP reduction via WorldManager
+        if let Some(entity_id) = self.entity_id {
+            let world_entity_id = self.visible_entities.keys()
+                .find(|id| id.data().as_ffi() as u32 == target_id);
+                
+            if let Some(&victim_id) = world_entity_id {
+                let _ = self.world_tx.send(WorldCommand::ApplyDamage {
+                    id: victim_id,
+                    damage: dmg_amount as i32,
+                    source_id: entity_id,
+                }).await;
+                log::info!("Applied {} spell damage to entity {:?}", dmg_amount, victim_id);
+            }
+        }
+    }
+
+    async fn send_begin_cast(&mut self, spell_id: u32, cast_time: u32, target_id: u32) {
+        let begin = BeginCast {
+            spell_id,
+            caster_id: self.entity_id.map(|e| (e.data().as_ffi() as u32) as u16).unwrap_or(0),
+            cast_time,
+        };
+
+        log::debug!("Sending OP_BeginCast: {:?}", begin);
+        let mut payload = Vec::new();
+        let mut cursor = Cursor::new(&mut payload);
+        if let Ok(_) = begin.write(&mut cursor) {
+            self.send_app_packet(OpCode::BeginCast, &payload).await;
+        }
+    }
+
 }
+

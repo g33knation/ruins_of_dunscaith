@@ -1,14 +1,15 @@
 use bytes::BufMut;
 use shared::net::eq_stream::{EqStreamSession as SharedSession, SessionRequest, ProcessPacketResult};
 use shared::opcodes::OpCode;
+use rand;
 
 pub struct EqStreamSession {
     session: SharedSession,
-    pool: sqlx::PgPool,
+    pool: Option<sqlx::PgPool>,
 }
 
 impl EqStreamSession {
-    pub fn new(session_id: u32, pool: sqlx::PgPool) -> Self {
+    pub fn new(session_id: u32, pool: Option<sqlx::PgPool>) -> Self {
         let mut session = SharedSession::new(session_id);
         session.crc_key = 0; // Force 0 for Login Server (Zero-Key DES)
         session.enable_combined(); // RoF2 stability
@@ -53,14 +54,13 @@ impl EqStreamSession {
     async fn handle_app_packet(&mut self, app_opcode: OpCode, payload: &[u8]) -> Option<Vec<Vec<u8>>> {
         match app_opcode {
             OpCode::SessionReady => { // 0x0001
-                tracing::info!("Handling OP_SessionReady, sending ExpansionData + HandshakeReply + StatRequest");
+                tracing::info!("Handling OP_SessionReady, sending HandshakeReply + StatRequest");
                 let mut replies = Vec::new();
-                replies.extend(self.create_login_expansion_data().await); // 0x0002
-                replies.extend(self.create_handshake_reply().await);     // 0x0017
+                replies.extend(self.create_handshake_reply().await);     
                 replies.push(self.session.create_stat_request());      
                 Some(replies)
             },
-            OpCode::Login | OpCode::Login2 => { // OP_Login (RoF2 uses 0x0003 as Login2)
+            OpCode::Login => { // OP_Login (RoF2 uses 0x0002)
                 tracing::info!("Received OP_Login (Op={:?})", app_opcode);
                 self.handle_login(payload).await
             },
@@ -102,6 +102,7 @@ impl EqStreamSession {
     }
 
     async fn handle_login(&mut self, data: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let mut packets = Vec::new();
         let header_size = 10;
         
         if data.len() < header_size {
@@ -123,54 +124,86 @@ impl EqStreamSession {
             let iv = [0u8; 8];
             let mut buffer = encrypted.to_vec();
             let decryptor = DesCbc::new(&key.into(), &iv.into());
-            if let Ok(plaintext) = decryptor.decrypt_padded_mut::<cipher::block_padding::NoPadding>(&mut buffer) {
-                let parts: Vec<&[u8]> = plaintext.split(|&b| b == 0).collect();
-                let username = parts.get(0).map(|b| String::from_utf8_lossy(b)).unwrap_or_default().to_string();
-                let password = parts.get(1).map(|b| String::from_utf8_lossy(b)).unwrap_or_default().to_string();
+            match decryptor.decrypt_padded_mut::<cipher::block_padding::NoPadding>(&mut buffer) {
+                Ok(plaintext) => {
+                    let parts: Vec<&[u8]> = plaintext.split(|&b| b == 0).collect();
+                    let username = parts.get(0).map(|b| String::from_utf8_lossy(b)).unwrap_or_default().to_string();
+                    let password = parts.get(1).map(|b| String::from_utf8_lossy(b)).unwrap_or_default().to_string();
 
-                tracing::info!("--- UDP LOGIN ATTEMPT for {} ---", username);
-                match sqlx::query("SELECT id, password FROM account WHERE name = $1")
-                    .bind(&username)
-                    .fetch_optional(&self.pool)
-                    .await {
-                    Ok(Some(row)) => {
+                    tracing::info!("--- UDP LOGIN ATTEMPT for {} ---", username);
+                    let row = if let Some(pool) = &self.pool {
+                        match sqlx::query("SELECT id, password FROM account WHERE name = $1")
+                            .bind(&username)
+                            .fetch_optional(pool)
+                            .await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!("DB error looking up user {}: {}", username, e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    if self.pool.is_none() && username == "testuser" && password == "testpass" {
+                        tracing::info!("UDP MOCK LOGIN: Auto-approving testuser");
+                        is_success = true;
+                        error_code = 101;
+                        packets.extend(self.create_login_response(true, 101, 1, "0123456789").await);
+                    } else if let Some(row) = row {
                         use sqlx::Row;
                         let db_pass: String = row.get("password");
+                        let account_id: i32 = row.get("id");
+                        
                         if db_pass == password {
-                            tracing::info!("UDP Authentication Success for {}", username);
+                            tracing::info!("UDP Authentication Success for {} (ID={})", username, account_id);
+                            
+                            // Generate Session Key
+                            let session_key = format!("{:05}", rand::random::<u16>());
+                            
+                            // Update DB with session key
+                            if let Some(pool) = &self.pool {
+                                let _ = sqlx::query("UPDATE account SET ls_session_key = $1 WHERE id = $2")
+                                    .bind(&session_key)
+                                    .bind(account_id)
+                                    .execute(pool)
+                                    .await;
+                            }
+
                             is_success = true;
                             error_code = 101; // No Error
+                            packets.extend(self.create_login_response(true, 101, account_id as u32, &session_key).await);
                         } else {
                             tracing::warn!("UDP Authentication Failed: Invalid password for {}", username);
                             is_success = false;
                             error_code = 13; // Common code for failure
+                            packets.extend(self.create_login_response(false, 13, 0, "").await);
                         }
-                    },
-                    Ok(None) => {
+                    } else {
                         tracing::warn!("UDP Authentication Failed: User {} not found", username);
                         is_success = false;
                         error_code = 13;
-                    },
-                    Err(e) => {
-                        tracing::error!("DB error looking up user {}: {}", username, e);
-                        is_success = false;
-                        error_code = 13;
+                        packets.extend(self.create_login_response(false, 13, 0, "").await);
                     }
                 }
-            } else {
-                tracing::warn!("Failed to decrypt login packet credentials.");
-                is_success = false;
-                error_code = 13;
+                Err(e) => {
+                    tracing::warn!("Failed to decrypt login packet credentials: {:?}", e);
+                    is_success = false;
+                    error_code = 13;
+                    packets.extend(self.create_login_response(false, 13, 0, "").await);
+                }
             }
         } else {
             // Token based login or empty payload
             tracing::warn!("UDP Login Attempt without credentials (Token logic not fully implemented). Denying.");
             is_success = false;
             error_code = 13;
+            packets.extend(self.create_login_response(false, 13, 0, "").await);
         }
         
-        let mut packets = Vec::new();
-        packets.extend(self.create_login_response(is_success, error_code).await); // Sent as 0x0004
+        // ServerListResponse is always sent after LoginAccepted
+        packets.extend(self.create_server_list_response_with_seq(0).await); 
         Some(packets)
     }
 
@@ -195,7 +228,7 @@ impl EqStreamSession {
         pkts
     }
 
-    async fn create_login_response(&mut self, is_success: bool, error_code: u32) -> Vec<Vec<u8>> {
+    async fn create_login_response(&mut self, is_success: bool, error_code: u32, account_id: u32, session_key: &str) -> Vec<Vec<u8>> {
         // AppOp: 0x0004 (OP_LoginAccepted - RoF2 UDP standard)
         let mut payload = Vec::with_capacity(90);
         
@@ -206,17 +239,16 @@ impl EqStreamSession {
         payload.put_u32_le(0);
         
         // Build PlayerLoginReply
-        let mut reply_struct = Vec::with_capacity(64);
-        reply_struct.put_u8(if is_success { 1 } else { 0 }); // Success flag
-        reply_struct.put_u32_le(error_code); 
-        reply_struct.put_u8(0); 
-        reply_struct.put_u8(0); 
-        reply_struct.put_u32_le(1); // LSID
+        let mut reply_struct = Vec::with_capacity(80);
+        reply_struct.put_u32_le(if is_success { 1 } else { 0 }); // Offset 0-3
+        reply_struct.put_u32_le(error_code);                    // Offset 4-7
+        reply_struct.put_u32_le(account_id);                    // Offset 8-11
         
-        // Key (16 bytes fixed length for alignment)
-        let key_str = b"0123456789\0";
-        reply_struct.put_slice(key_str);
-        for _ in 0..(16 - key_str.len()) {
+        // Key (Offset 12-43)
+        let k_bytes = session_key.as_bytes();
+        reply_struct.put_slice(k_bytes);
+        reply_struct.put_u8(0); // Null terminator
+        for _ in 0..(31 - k_bytes.len()) {
             reply_struct.put_u8(0);
         }
 
@@ -231,12 +263,13 @@ impl EqStreamSession {
         reply_struct.put_u32_le(0xFFFFFFFF); 
         reply_struct.put_u32_le(0xFFFFFFFF); 
         reply_struct.put_u32_le(0); 
-        // reply_struct.put_u16_le(0); // Padding removed
         
         while reply_struct.len() < 80 {
             reply_struct.put_u8(0);
         }
         
+        tracing::info!("DEBUG: LoginAccepted ReplyStruct Hex: {:02X?}", reply_struct);
+
         // Encrypt
         use des::Des;
         use cipher::{BlockEncryptMut, KeyIvInit};
@@ -250,52 +283,10 @@ impl EqStreamSession {
         } else {
             payload.put_slice(&reply_struct);
         }
-        // payload.put_slice(&[0u8; 16]); // REMOVED Extra Padding
-        let pkts = self.session.create_reliable_packets(OpCode::ServerListRequest, &payload).await; // 0x0004 = LoginAccepted
+        let pkts = self.session.create_reliable_packets(OpCode::LoginAccepted, &payload).await; // 0x0018 = LoginAccepted
         pkts
     }
 
-    async fn create_login_expansion_data(&mut self) -> Vec<Vec<u8>> {
-        // AppOp: 0x0002 (OP_LoginExpansionData)
-        let mut payload = Vec::with_capacity(1024);
-        
-        // LoginBaseMessage
-        payload.put_u32_le(0); 
-        payload.put_u8(0);     
-        payload.put_u8(0);     
-        payload.put_u32_le(0); 
-        
-        payload.put_u32_le(0);
-        payload.put_u32_le(0); 
-        payload.put_u16_le(0); 
-        
-        payload.put_u32_le(19); // Count = 19
-        
-        let expansion_ids = [
-            3007, 3008, 3009, 3010, 3012,
-            3014, 3031, 3033, 3036, 3040,
-            3045, 3046, 3047, 3514, 3516,
-            3518, 3520, 3522, 3524
-        ];
-        
-        for (i, &ex_id) in expansion_ids.iter().enumerate() {
-            payload.put_u32_le(i as u32);
-            payload.put_u32_le(1); 
-            payload.put_u8(0);
-            payload.put_u32_le(ex_id);
-            payload.put_u32_le(0x179E);
-            payload.put_u32_le(0xFFFFFFFF);
-            
-            payload.put_u8(0);
-            payload.put_u8(0);
-            payload.put_u32_le(0);
-            payload.put_u32_le(0);
-            payload.put_u32_le(0xFFFFFFFF);
-        }
-        
-        let pkts = self.session.create_reliable_packets(OpCode::Login, &payload).await;
-        pkts
-    }
     async fn create_server_list_response_with_seq(&mut self, sequence: u32) -> Vec<Vec<u8>> {
         let mut payload = Vec::with_capacity(200);
         

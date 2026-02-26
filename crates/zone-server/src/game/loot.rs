@@ -9,56 +9,62 @@ pub struct LootDrop {
 
 #[derive(Clone)]
 pub struct LootManager {
-    db_pool: PgPool,
+    db_pool: Option<PgPool>,
 }
 
 impl LootManager {
-    pub fn new(db_pool: PgPool) -> Self {
+    pub fn new(db_pool: Option<PgPool>) -> Self {
         Self { db_pool }
     }
 
+    /// Rolls for loot based on a loottable_id.
     pub async fn roll_loot(&self, loottable_id: i32) -> Result<Vec<i32>, sqlx::Error> {
+        if self.db_pool.is_none() {
+            return Ok(vec![]);
+        }
+        let pool = self.db_pool.as_ref().unwrap();
         let mut dropped_items = Vec::new();
 
-        // 1. Get loottable entries (probability of the entire table/group)
-        // Note: Simplified logic. In real EQEmu, there are multiple layers and "multiplier" logic.
-        let entries = sqlx::query(
-            r#"
-            SELECT id, probability 
-            FROM loottable_entries 
-            WHERE loottable_id = $1
-            "#,
+        // 1. Get loottable entries
+        let table_entries = sqlx::query(
+            "SELECT lootdrop_id, probability, multiplier FROM loottable_entries WHERE loottable_id = $1"
         )
         .bind(loottable_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
 
-        for entry in entries {
-            let id: i32 = entry.get("id");
-            let probability: f32 = entry.get("probability");
+        for row in table_entries {
+            let lootdrop_id: i32 = row.get("lootdrop_id");
+            let probability: f32 = row.get("probability");
+            let multiplier: i32 = row.try_get("multiplier").unwrap_or(1);
 
-            if rand::thread_rng().gen::<f32>() * 100.0 <= probability {
-                // 2. Get loot drops for this entry/group
-                let drops = sqlx::query(
-                    r#"
-                    SELECT item_id, chance 
-                    FROM lootdrop_entries 
-                    WHERE lootdrop_id = (SELECT lootdrop_id FROM loottable_entries WHERE id = $1 LIMIT 1)
-                    "#,
-                )
-                .bind(id)
-                .fetch_all(&self.db_pool)
-                .await?;
+            // Roll for this group without binding RNG to a variable that persists across awaits
+            let dropped_group = rand::thread_rng().gen_range(0.0..100.0) <= probability;
 
-                for drop in drops {
-                    let item_id: i32 = drop.get("item_id");
-                    let chance: f32 = drop.get("chance");
+            if dropped_group {
+                for _ in 0..multiplier {
+                    let items_in_drop = sqlx::query(
+                        "SELECT item_id, chance FROM lootdrop_entries WHERE lootdrop_id = $1"
+                    )
+                    .bind(lootdrop_id)
+                    .fetch_all(pool)
+                    .await?;
 
-                    if rand::thread_rng().gen::<f32>() * 100.0 <= chance {
-                        dropped_items.push(item_id);
+                    for item_row in items_in_drop {
+                        let item_id: i32 = item_row.get("item_id");
+                        let chance: f32 = item_row.get("chance");
+
+                        // Roll for each item
+                        if rand::thread_rng().gen_range(0.0..100.0) <= chance {
+                            dropped_items.push(item_id);
+                        }
                     }
                 }
             }
+        }
+
+        if !dropped_items.is_empty() {
+            log::info!("Loot rolled for loottable {}: {:?}", loottable_id, dropped_items);
         }
 
         Ok(dropped_items)

@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "mysql", "postgres", "macros", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "mysql", "postgres", "macros", "chrono"] }
 binrw = "0.13"
 log = "0.4"
 bytes = "1.5"

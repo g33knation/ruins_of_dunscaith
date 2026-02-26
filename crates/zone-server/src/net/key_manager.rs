@@ -18,11 +18,11 @@ pub enum KeyManagerRequest {
 // --- Actor ---
 pub struct ZoneKeyManager {
     rx: mpsc::Receiver<KeyManagerRequest>,
-    pool: sqlx::PgPool, 
+    pool: Option<sqlx::PgPool>, 
 }
 
 impl ZoneKeyManager {
-    pub fn new(pool: sqlx::PgPool) -> (Self, mpsc::Sender<KeyManagerRequest>) {
+    pub fn new(pool: Option<sqlx::PgPool>) -> (Self, mpsc::Sender<KeyManagerRequest>) {
         let (tx, rx) = mpsc::channel(32);
         (Self { rx, pool }, tx)
     }
@@ -34,9 +34,14 @@ impl ZoneKeyManager {
                     log::info!("ZoneKeyManager: RegisterKey ignored for Account {}", account_id);
                 },
                 KeyManagerRequest::ValidateKey { account_id, session_id: _, respond_to } => {
+                     if self.pool.is_none() {
+                         let _ = respond_to.send(true); // Always valid in mock
+                         continue;
+                     }
                      // Verify against DB accounts table
-                     let res = sqlx::query!("SELECT id FROM accounts WHERE id = $1", account_id as i32)
-                        .fetch_optional(&self.pool)
+                     let res = sqlx::query("SELECT id FROM accounts WHERE id = $1")
+                        .bind(account_id as i32)
+                        .fetch_optional(self.pool.as_ref().unwrap())
                         .await;
                         
                      let is_valid = match res {

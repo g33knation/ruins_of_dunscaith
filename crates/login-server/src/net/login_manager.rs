@@ -4,11 +4,11 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 pub struct LoginManager {
-    pool: sqlx::PgPool,
+    pool: Option<sqlx::PgPool>,
 }
 
 impl LoginManager {
-    pub async fn new(pool: sqlx::PgPool) -> anyhow::Result<Self> {
+    pub async fn new(pool: Option<sqlx::PgPool>) -> anyhow::Result<Self> {
         Ok(Self { pool })
     }
 

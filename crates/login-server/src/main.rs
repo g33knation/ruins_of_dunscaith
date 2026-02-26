@@ -12,10 +12,15 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     info!("Starting Rust Login Server (Dual TCP/UDP)...");
     
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url).await?;
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "stub".to_string());
+    let pool = if database_url == "stub" {
+        info!("Running in STUBBED database mode (Testing only)");
+        None
+    } else {
+        Some(sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url).await?)
+    };
 
     // 2. Start Dual-Protocol Login (RoF2/Akk-Stack Support)
     // 2a. UDP Discovery Handlers (Ports 5998 & 5999)

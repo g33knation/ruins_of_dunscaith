@@ -5,7 +5,7 @@ use crate::net::eqstream::EqStreamSession; // Local wrapper
 use bytes::BufMut;
 use std::io::Write; // Import flush
 
-pub async fn start_discovery_listener(port: u16, pool: sqlx::PgPool) -> anyhow::Result<()> {
+pub async fn start_discovery_listener(port: u16, pool: Option<sqlx::PgPool>) -> anyhow::Result<()> {
     // Bind to 0.0.0.0 to catch traffic on all interfaces (Loopback, LAN, etc.)
     let addr = format!("0.0.0.0:{}", port);
     let sock = UdpSocket::bind(&addr).await?;
@@ -16,9 +16,9 @@ pub async fn start_discovery_listener(port: u16, pool: sqlx::PgPool) -> anyhow::
     loop {
         let mut buf = [0u8; 1024];
         match sock.recv_from(&mut buf).await {
-            Ok((len, addr)) => {
-                let data = &buf[..len];
-                // info!("Received {} bytes from {}", len, addr);
+                Ok((len, addr)) => {
+                    let data = &buf[..len];
+                    info!("UDP RX from {}: {:02x?}", addr, data);
  
                 match parse_eqstream(data) {
                     Ok((_, packet)) => {
@@ -33,15 +33,16 @@ pub async fn start_discovery_listener(port: u16, pool: sqlx::PgPool) -> anyhow::
                                 sessions.insert(addr, session);
                                 
                                 sock.send_to(&response, addr).await?;
-                                info!("Sent EQStream Session Response: {} bytes", response.len());
+                                info!("Sent Session Response to {}: {:02x?}", addr, response);
                             },
                             EQStreamPacket::Unknown(opcode, payload) => {
                                 if let Some(session) = sessions.get_mut(&addr) {
                                     let responses = session.receive_packet(opcode, &payload).await;
-                                    for resp in responses {
-                                        let _ = sock.send_to(&resp, addr).await;
-                                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                                    }
+                                     for resp in responses {
+                                         info!("Sending Response to {}: {:02x?}", addr, resp);
+                                         let _ = sock.send_to(&resp, addr).await;
+                                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                     }
                                 } else {
                                     // info!("Unknown Packet from Unknown Session {}: Op={:04X}", addr, opcode);
                                 }

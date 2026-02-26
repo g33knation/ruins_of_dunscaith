@@ -4,6 +4,8 @@ use clap::{Parser, Subcommand};
 mod env;
 mod docker;
 mod system;
+mod setup;
+mod purge;
 
 #[derive(Parser)]
 #[command(name = "akk-rust")]
@@ -31,6 +33,10 @@ enum Commands {
     },
     /// Show server information
     Info,
+    /// Initialize the environment
+    Setup,
+    /// Purge legacy directories (src/, akk-stack-legacy/)
+    Purge,
 }
 
 #[derive(Subcommand)]
@@ -68,6 +74,12 @@ async fn main() -> Result<()> {
         },
         Commands::Info => {
             system::info()?;
+        }
+        Commands::Setup => {
+            setup::execute().await?;
+        }
+        Commands::Purge => {
+            purge::execute()?;
         }
     }
 

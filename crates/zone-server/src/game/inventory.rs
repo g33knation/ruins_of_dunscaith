@@ -21,13 +21,13 @@ pub enum InventoryRequest {
 
 pub struct InventoryManager {
     rx: mpsc::Receiver<InventoryRequest>,
-    pool: sqlx::PgPool,
+    pool: Option<sqlx::PgPool>,
     // Cache?
     // cache: HashMap<u32, Vec<InventoryItem>>,
 }
 
 impl InventoryManager {
-    pub fn new(pool: sqlx::PgPool) -> (Self, mpsc::Sender<InventoryRequest>) {
+    pub fn new(pool: Option<sqlx::PgPool>) -> (Self, mpsc::Sender<InventoryRequest>) {
         let (tx, rx) = mpsc::channel(100);
         (Self { rx, pool }, tx)
     }
@@ -37,19 +37,22 @@ impl InventoryManager {
         while let Some(msg) = self.rx.recv().await {
              match msg {
                  InventoryRequest::Load { char_id, respond_to } => {
-                     let res = sqlx::query_as!(
-                         InventoryItem,
+                     if self.pool.is_none() {
+                         let _ = respond_to.send(vec![]); // Mock empty inventory
+                         continue;
+                     }
+                     let res = sqlx::query_as::<_, InventoryItem>(
                          r#"
                          SELECT 
                             item_id, 
-                            slot_id::smallint as "slot_id!", 
-                            quantity::smallint as "quantity!"
+                            slot_id, 
+                            quantity
                          FROM inventory_items 
                          WHERE char_id = $1
-                         "#,
-                         char_id as i32
+                         "#
                      )
-                     .fetch_all(&self.pool)
+                     .bind(char_id as i32)
+                     .fetch_all(self.pool.as_ref().unwrap())
                      .await;
                      
                      match res {

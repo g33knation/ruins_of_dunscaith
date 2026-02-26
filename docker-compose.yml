@@ -7,6 +7,8 @@ services:
       - DATABASE_URL=postgres://eqemu:eqemupass@127.0.0.1:5432/peq
       - RUST_LOG=info
       - PUBLIC_IP=192.168.1.24
+    depends_on:
+      - postgres
 
   world:
     build: .
@@ -16,7 +18,7 @@ services:
       - DATABASE_URL=postgres://eqemu:eqemupass@127.0.0.1:5433/peq
       - RUST_LOG=info
     depends_on:
-      - login
+      - postgres
 
   zone:
     build: .
@@ -26,4 +28,51 @@ services:
       - DATABASE_URL=postgres://eqemu:eqemupass@127.0.0.1:5433/peq
       - RUST_LOG=info
     depends_on:
-      - world
+      - postgres
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  zeroclaw:
+    build:
+      context: ./zeroclaw
+      dockerfile: Dockerfile
+    container_name: zeroclaw
+    environment:
+      - DATABASE_URL=host=postgres user=eqemu password=eqemupass dbname=peq
+      - OLLAMA_HOST=http://ollama:11434
+      - ZEROCLAW_GATEWAY_PORT=8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./.zeroclaw:/root/.zeroclaw
+    depends_on:
+      - postgres
+      - ollama
+
+volumes:
+  postgres_data:
+  ollama_data:

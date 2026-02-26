@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 shared = { path = "../shared" }
 tokio = { version = "1.36", features = ["full"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "mysql", "postgres", "macros", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "mysql", "postgres", "macros", "chrono"] }
 num-traits = "0.2"
 dotenv = "0.15"
 binrw = "0.13"

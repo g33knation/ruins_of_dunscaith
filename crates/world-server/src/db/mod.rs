@@ -21,13 +21,18 @@ struct AccountIdRow {
 
 #[derive(Clone, Debug)]
 pub struct DatabaseManager {
-    pool: Pool<Postgres>,
+    pool: Option<Pool<Postgres>>,
 }
 
 impl DatabaseManager {
     pub async fn new() -> Result<Self> {
-        let database_url = env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+        let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "stub".to_string());
         
+        if database_url == "stub" {
+            info!("DatabaseManager running in STUB mode.");
+            return Ok(Self { pool: None });
+        }
+
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&database_url)
@@ -36,7 +41,7 @@ impl DatabaseManager {
             
         info!("DatabaseManager connected to Postgres.");
         
-        Ok(Self { pool })
+        Ok(Self { pool: Some(pool) })
     }
     
     // Example Method for Char Create
@@ -58,7 +63,11 @@ impl DatabaseManager {
         deity: i16,
         start_zone: i32,
     ) -> Result<i32> {
-        let mut tx = self.pool.begin().await?;
+        if self.pool.is_none() {
+            info!("MOCK: Creating character {}", name);
+            return Ok(1); // Mock ID
+        }
+        let mut tx = self.pool.as_ref().unwrap().begin().await?;
 
         let rec = sqlx::query_as::<_, (i32,)>(
             "INSERT INTO character_data (account_id, name, race, class, gender, level, 
@@ -79,6 +88,15 @@ impl DatabaseManager {
     }
     
     pub async fn get_characters(&self, account_id: i32) -> Result<Vec<shared::db::Character>> {
+        if self.pool.is_none() {
+            let mut c = shared::db::Character::default();
+            c.id = 1;
+            c.account_id = account_id;
+            c.name = "TestChar".to_string();
+            c.level = 60;
+            c.zone_id = 1;
+            return Ok(vec![c]);
+        }
         let rows = sqlx::query_as::<_, shared::db::Character>(
             "SELECT id, account_id, name, last_name, zone_id, zone_instance,
              y, x, z, heading, gender, race, class, level, exp, points as practice_points,
@@ -88,27 +106,31 @@ impl DatabaseManager {
              FROM character_data WHERE account_id = $1"
         )
         .bind(account_id)
-        .fetch_all(&self.pool).await?;
+        .fetch_all(self.pool.as_ref().unwrap()).await?;
 
         info!("get_characters returning {} chars", rows.len());
         Ok(rows)
     }
 
     pub async fn check_name_availability(&self, name: &str) -> Result<bool> {
+        if self.pool.is_none() { return Ok(true); }
         let rec = sqlx::query_as::<_, (Option<i64>,)>("SELECT count(*) FROM character_data WHERE name = $1")
             .bind(name)
-            .fetch_one(&self.pool).await?;
+            .fetch_one(self.pool.as_ref().unwrap()).await?;
         let count = rec.0.unwrap_or(0);
         
         Ok(count == 0)
     }
 
     pub async fn get_character_location(&self, name: &str) -> Result<(i32, f32, f32, f32, f32)> {
+        if self.pool.is_none() { 
+            return Ok((1, 0.0, 0.0, 0.0, 0.0));
+        }
         let rec = sqlx::query_as::<_, WorldIpRow>(
             "SELECT zone_id, x, y, z, heading FROM character_data WHERE name = $1"
         )
         .bind(name)
-        .fetch_optional(&self.pool).await?;
+        .fetch_optional(self.pool.as_ref().unwrap()).await?;
         
         match rec {
             Some(r) => Ok((
@@ -123,18 +145,19 @@ impl DatabaseManager {
     }
 
     pub async fn delete_character(&self, account_id: i32, name: &str) -> Result<bool> {
+        if self.pool.is_none() { return Ok(true); }
         let char_id_rec = sqlx::query_as::<_, AccountIdRow>(
             "SELECT id FROM character_data WHERE account_id = $1 AND name = $2"
         )
         .bind(account_id)
         .bind(name)
-        .fetch_optional(&self.pool).await?;
+        .fetch_optional(self.pool.as_ref().unwrap()).await?;
         
         if let Some(rec) = char_id_rec {
             let char_id = rec.id;
             let result = sqlx::query("DELETE FROM character_data WHERE id = $1")
                 .bind(char_id)
-                .execute(&self.pool).await;
+                .execute(self.pool.as_ref().unwrap()).await;
             Ok(result.is_ok())
         } else {
             Ok(false)
@@ -142,12 +165,16 @@ impl DatabaseManager {
     }
 
     pub async fn verify_session(&self, account_id: i32, session_key: &str) -> Result<bool> {
+        if self.pool.is_none() {
+            info!("MOCK: Verifying session for account {}", account_id);
+            return Ok(true);
+        }
         let rec = sqlx::query_as::<_, AccountIdRow>(
             "SELECT id FROM account WHERE id = $1 AND ls_session_key = $2"
         )
         .bind(account_id)
         .bind(session_key)
-        .fetch_optional(&self.pool).await?;
+        .fetch_optional(self.pool.as_ref().unwrap()).await?;
         
         Ok(rec.is_some())
     }

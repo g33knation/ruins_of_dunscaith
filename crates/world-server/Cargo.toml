@@ -12,7 +12,7 @@ binrw = "0.13"
 bytes = "1.5"
 flate2 = "1.0"
 dotenv = "0.15"
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "mysql", "postgres", "macros", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "mysql", "postgres", "macros", "chrono"] }
 bitflags = "2.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"

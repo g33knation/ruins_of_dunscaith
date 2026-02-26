@@ -13,13 +13,13 @@ pub struct MerchantItem {
 
 #[derive(Clone)]
 pub struct MerchantManager {
-    db_pool: PgPool,
+    db_pool: Option<PgPool>,
     // Cache for merchant inventories: npc_type_id -> items
     inventory_cache: HashMap<i32, Vec<MerchantItem>>,
 }
 
 impl MerchantManager {
-    pub fn new(db_pool: PgPool) -> Self {
+    pub fn new(db_pool: Option<PgPool>) -> Self {
         Self {
             db_pool,
             inventory_cache: HashMap::new(),
@@ -35,6 +35,9 @@ impl MerchantManager {
     }
 
     async fn load_inventory(&self, npc_type_id: i32) -> Result<Vec<MerchantItem>> {
+        if self.db_pool.is_none() {
+            return Ok(Vec::new());
+        }
         info!("Loading merchant inventory for NPC type {}", npc_type_id);
 
         // 1. Get merchant_id from npc_types
@@ -42,7 +45,7 @@ impl MerchantManager {
             "SELECT merchant_id FROM npc_types WHERE id = $1"
         )
         .bind(npc_type_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(self.db_pool.as_ref().unwrap())
         .await
         .context("Failed to query merchant_id from npc_types")?;
 
@@ -59,7 +62,7 @@ impl MerchantManager {
             "SELECT item, slot, probability FROM merchantlist WHERE merchant_id = $1 ORDER BY slot ASC"
         )
         .bind(m_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(self.db_pool.as_ref().unwrap())
         .await
         .context("Failed to query merchantlist")?;
 
@@ -77,11 +80,14 @@ impl MerchantManager {
     }
 
     pub async fn get_item_price(&self, item_id: i32) -> Result<u32> {
+        if self.db_pool.is_none() {
+            return Ok(10); // Mock price
+        }
         let price: Option<i32> = sqlx::query_scalar(
             "SELECT price FROM items WHERE id = $1"
         )
         .bind(item_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(self.db_pool.as_ref().unwrap())
         .await
         .context("Failed to query item price")?;
 

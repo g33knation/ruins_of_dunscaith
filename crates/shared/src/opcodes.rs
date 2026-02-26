@@ -5,14 +5,16 @@ use serde::{Serialize, Deserialize};
 #[repr(u16)]
 pub enum OpCode {
     // Login Opcodes
+    // Login Opcodes (RoF2 Protocol 3)
+    // Login Opcodes (RoF2 Profile)
     SessionReady = 0x0001,
     Login = 0x0002,
-    Login2 = 0x0003,
-    LoginApproval = 0x0017,
-    ServerListRequest = 0x0004, // Corrected from 0x0005 to match login_server expectation or variant?
-    ServerListResponse = 0x0018, // Fixed alignment
+    ServerListRequest = 0x0004,
     PlayEverquestRequest = 0x000d,
-    PlayEverquestResponse = 0x0021,
+    LoginApproval = 0x0017, // Initial Handshake Reply
+    LoginAccepted = 0x0018, // Sent after OP_Login
+    ServerListResponse = 0x0019, // Sent after OP_ServerListRequest
+    PlayEverquestResponse = 0x0022,
 
     // World Opcodes
     SendLoginInfo = 0x7a09,
@@ -22,7 +24,8 @@ pub enum OpCode {
     CharSelectRequest = 0x00d1,
     ExpansionInfo = 0x590d,
     GuildsList = 0x507a,
-    EnterWorld = 0x57c3,
+    EnterWorld = 0x578f,
+    PostEnterWorld = 0x6259,
     SendMaxCharacters = 0x5475,
     SendMembership = 0x7acc,
     SendMembershipDetails = 0x057b,
@@ -31,7 +34,7 @@ pub enum OpCode {
     DeleteCharacter = 0x1808,
     ApproveName = 0x56a2,
     Motd = 0x0c22,
-    SendZonePoints = 0x3234,
+    SendZonePoints = 0x69a4,
     TributeInfo = 0x4254,
     TimeOfDay = 0x5070,
     MercenaryData = 0x3e98,
@@ -64,6 +67,13 @@ pub enum OpCode {
     ShopSell = 0x6582,
     ShopList = 0x794a,
     MoneyUpdate = 0x4859,
+    
+    // Spell Opcodes (RoF2)
+    BeginCast = 0x1fca,
+    CastSpell = 0x0746,
+    InterruptCast = 0x13c9,
+    Action = 0x4642, // RoF2 OP_Action
+    Action2 = 0x79ea, // RoF2 OP_Action2 (often follows Action)
 
     // RoF2 Specifics / Observed
     RoF2ClientReady = 0x1100,

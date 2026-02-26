@@ -48,11 +48,11 @@ pub struct LoginResponseBody {
 pub struct LoginSessionActor {
     data: LoginSessionData,
     socket: ClientSocket,
-    pool: sqlx::PgPool,
+    pool: Option<sqlx::PgPool>,
 }
 
 impl LoginSessionActor {
-    pub fn new(socket: ClientSocket, pool: sqlx::PgPool) -> Self {
+    pub fn new(socket: ClientSocket, pool: Option<sqlx::PgPool>) -> Self {
         Self {
             data: LoginSessionData::default(),
             socket,
@@ -109,15 +109,34 @@ impl LoginSessionActor {
                 self.data.state = ClientState::Authenticating;
 
                 // Query Database
-                let row = sqlx::query("SELECT id, password FROM account WHERE name = $1")
-                    .bind(&username)
-                    .fetch_optional(&self.pool)
-                    .await?;
+                let row = if let Some(pool) = &self.pool {
+                    sqlx::query("SELECT id, password FROM account WHERE name = $1")
+                        .bind(&username)
+                        .fetch_optional(pool)
+                        .await?
+                } else {
+                    // MOCK MODE: Always allow testuser/testpass
+                    if username == "testuser" {
+                        info!("MOCK LOGIN: Auto-approving testuser");
+                        // We need a way to mock the row. Since sqlx doesn't make it easy to create a Row manually,
+                        // we'll just handle the logic directly here.
+                        None 
+                    } else {
+                        None
+                    }
+                };
 
                 let mut error_code = 13; // Default to Error
                 let mut account_id_out = 0;
 
-                if let Some(row) = row {
+                if self.pool.is_none() && username == "testuser" && password == "testpass" {
+                    // Hardcoded success for mock mode
+                    account_id_out = 1;
+                    error_code = 0;
+                    self.data.is_authenticated = true;
+                    self.data.username = username.clone();
+                    self.data.state = ClientState::Authorized;
+                } else if let Some(row) = row {
                     use sqlx::Row;
                     let db_pass: String = row.get("password");
                     account_id_out = row.get("id");
@@ -153,11 +172,13 @@ impl LoginSessionActor {
                     session_key.copy_from_slice(key_str.as_bytes());
 
                     // Save to DB for World server verification
-                    let _ = sqlx::query("UPDATE account SET ls_session_key = $1 WHERE id = $2")
-                        .bind(&key_str)
-                        .bind(account_id_out)
-                        .execute(&self.pool)
-                        .await;
+                    if let Some(pool) = &self.pool {
+                        let _ = sqlx::query("UPDATE account SET ls_session_key = $1 WHERE id = $2")
+                            .bind(&key_str)
+                            .bind(account_id_out)
+                            .execute(pool)
+                            .await;
+                    }
                 }
 
                 let response = LoginResponseBody {
